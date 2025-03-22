@@ -1,34 +1,100 @@
+#include <math.h>
 #include "ftl.h"
 
 //#define FEMU_DEBUG_FTL
 
 static int gcCount = 0;
-static uint64_t hostPageWrites = 0, ssdPageWrites = 0, GCPageWrites = 0;
+static uint64_t hostPageWrites = 0, ssdPageWrites = 0, GCPageWrites = 0, parityPageWrites = 0;
 static int currStripeOffset = 0, parityReverseOffset = 0;
 static struct ppa currParityPage;
 static const uint64_t PARITYLPN = INVALID_LPN - 1;
 
+static const double K = 1.7437012;
+static const double ALPHA = 4.5326348e-13;
+static const double EPSILON = 7.2282898e-07;
+
+static inline double RBER(int cycle) {
+    return EPSILON + ALPHA * pow(cycle, K);
+}
+
+static double UPER(int cycle) {
+    const int BITS = 4096 * 8;
+    const int ECC = 8;
+
+    double rber = RBER(cycle);
+    double combin = 1;
+    for (int i = 1;i <= ECC + 1;i++) {
+        combin *= (double)(BITS - i + 1) / i;
+    }
+    double currTerm = combin * pow(rber, ECC + 1) * pow(1 - rber, BITS - ECC - 1);
+    double pe = currTerm;
+    for (int i = ECC + 2;i <= BITS;i++) {
+        double mul = (double)(BITS - i + 1) * rber / (1 - rber) / i;
+        if (mul <= 1e-2) {
+            break;
+        }
+        currTerm *= mul;
+        pe += currTerm;
+    }
+
+    return pe;
+}
+
+static double DevicePFail(struct ssd* ssd) {
+    struct ssdparams* spp = &ssd->sp;
+    double p = 0, maxuper = 0, minuper = 0;
+    int maxstripe = 0, minstripe = 0;
+    for (int lid = 0; lid < spp->tt_lines; lid++) {
+        double minus = 0, sum = 0;
+        int bk = lid * spp->rain_stripe_size;
+        int blk = bk / spp->tt_luns;
+        int lun = (bk % spp->tt_luns) / spp->nchs;
+        int ch = bk % spp->nchs;
+        struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
+        double uper = UPER(bl->erase_cnt);
+        sum += uper * spp->rain_stripe_size;
+        minus += uper * uper * spp->rain_stripe_size;
+        double stripeuper = (sum * sum - minus) / 2.0;
+        if (lid == 0 || sum > maxuper) {
+            maxuper = sum;
+            maxstripe = lid;
+        }
+        if (lid == 0 || sum < minuper) {
+            minuper = sum;
+            minstripe = lid;
+        }
+        p += stripeuper;
+    }
+    printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
+    return p * spp->pgs_per_blk;
+}
+
 void dumpBlocks(struct ssd* ssd) {
-    printf("*************** line erase count *********************\n");
+    // printf("*************** line erase count *********************\n");
     struct ssdparams* spp = &ssd->sp;
     if (spp->rain_stripe_size > 1) {
-        for (int b = 0; b < ssd->sp.tt_lines; b++) {
-            int lineblk = b * spp->rain_stripe_size;
-            int blk = lineblk / spp->tt_luns;
-            int lun = (lineblk % spp->tt_luns) / spp->nchs;
-            int ch = lineblk % spp->nchs;
-            struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
-            printf("%d ", bl->erase_cnt);
-        }
+        double p = DevicePFail(ssd);
+        printf("devicep %e\n", p);
     } else {
         struct nand_plane* pl = &ssd->ch[0].lun[0].pl[0];
-        for (int b = 0; b < ssd->sp.tt_lines; b++) {
-            int cnt = pl->blk[b].erase_cnt;
-            printf("%d ", cnt);
+        double p = 0, maxuper = 0, minuper = 0;
+        int maxstripe = 0, minstripe = 0;
+        for (int b = 0; b < spp->tt_lines; b++) {
+            double uper = UPER(pl->blk[b].erase_cnt);
+            if (b == 0 || uper > maxuper) {
+                maxuper = uper;
+                maxstripe = b;
+            }
+            if (b == 0 || uper < minuper) {
+                minuper = uper;
+                minstripe = b;
+            }
+            p += uper;
         }
+        printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
+        printf("devicep %e\n", p* spp->pgs_per_line);
     }
-    printf("\nhost pages: %lu, ssd pages: %lu, gc pages: %lu, WAF: %lf", hostPageWrites, ssdPageWrites, GCPageWrites, (double)ssdPageWrites / hostPageWrites);
-    printf("\n******************************************************\n");
+    // printf("\n******************************************************\n");
 }
 
 static void* ftl_thread(void* arg);
@@ -206,6 +272,8 @@ static uint64_t new_parity_write_page(struct ssd* ssd, struct ppa* new_ppa, uint
         gcw.stime = 0;
         ssd_advance_status(ssd, new_ppa, &gcw);
     }
+
+    parityPageWrites += 1;
 
     return 0;
 }
@@ -894,8 +962,9 @@ static int do_gc(struct ssd* ssd, bool force)
     gcCount += 1;
     if (gcCount % spp->tt_lines == 0) {
         int cycles = gcCount / spp->tt_lines;
-        printf("cycles: %d, gc count: %d\n", cycles, gcCount);
-        if (cycles % 1 == 0) {
+        if (cycles % 50 == 0) {
+            printf("\ncycles %d gccount %d\n", cycles, gcCount);
+            printf("hostpages %lu ssdpages %lu gcpages %lu paritypages %lu WAF %e\n", hostPageWrites, ssdPageWrites, GCPageWrites, parityPageWrites, (double)ssdPageWrites / hostPageWrites);
             dumpBlocks(ssd);
         }
     }
