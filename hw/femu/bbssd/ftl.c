@@ -5,30 +5,7 @@
 
 static int gcCount = 0;
 static uint64_t hostPageWrites = 0, ssdPageWrites = 0, GCPageWrites = 0, parityPageWrites = 0;
-static int swapFreeCount = 0, clearFullCount = 0;
-static int currStripeOffset = 0, parityReverseOffset = 0;
-static struct ppa currParityPage;
-static const uint64_t PARITYLPN = INVALID_LPN - 1;
-static int* blk2line = NULL, * line2blk = NULL;
-static double* blkuper;
-
-typedef struct LIF {
-    struct line* ln;
-    double lineUPER;
-    size_t writtenMinPos, freeMinPos, freeMaxPos; // for priority queue
-} LineInfo;
-
-static double UPERsum = 0;
-static LineInfo* lineinfo;
-pqueue_t* writtenMinPQ, * freeMinPQ, * freeMaxPQ;
-
-typedef struct UPERINDEX {
-    double uper;
-    int blkid;
-    bool chosen;
-} UPERIndex;
-
-static UPERIndex* UPERBuffer;
+static int* page2stripe, * stripe2page;
 
 static const double K = 1.7437012;
 static const double ALPHA = 4.5326348e-13;
@@ -63,62 +40,73 @@ static double UPER(int cycle) {
 
 static double DevicePFail(struct ssd* ssd) {
     struct ssdparams* spp = &ssd->sp;
-    double p = 0, maxuper = 0, minuper = 0;
+    double pdev = 0, maxuper = 0, minuper = 0;
     int maxstripe = 0, minstripe = 0;
-    for (int lid = 0; lid < spp->tt_lines; lid++) {
-        int lineblk = lid * spp->rain_stripe_size;
+    int totalstripes = spp->tt_pgs / spp->rain_stripe_size;
+    for (int stripeid = 0; stripeid < totalstripes; stripeid += 1) {
         double minus = 0, sum = 0;
-        for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-            int bk = line2blk[lineblk + o];
-            sum += blkuper[bk];
-            minus += blkuper[bk] * blkuper[bk];
+        for (int offset = 0;offset < spp->rain_stripe_size;offset += 1) {
+            int pageid = stripe2page[stripeid * spp->rain_stripe_size + offset];
+            // uint64_t lpn = ssd->rmap[pageid];
+            // if (lpn != INVALID_LPN) {
+            //     struct ppa p = ssd->maptbl[lpn];
+            //     assert(p.ppa != UNMAPPED_PPA);
+            //     if (lpn >= spp->parity_start_lpn) {
+            //         assert(lpn - spp->parity_start_lpn == stripeid);
+            //         assert(offset == spp->rain_stripe_size - 1);
+            //     } else {
+            //         assert(lpn / (spp->rain_stripe_size - 1) == stripeid);
+            //         assert(lpn % (spp->rain_stripe_size - 1) == offset);
+            //     }
+            // }
+
+            int ch = pageid / spp->pgs_per_ch;
+            int lun = (pageid % spp->pgs_per_ch) / spp->pgs_per_lun;
+            int blk = (pageid % spp->pgs_per_pl) / spp->pgs_per_blk;
+            struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
+            double uper = UPER(bl->erase_cnt);
+            sum += uper;
+            minus += uper * uper;
         }
         double stripeuper = (sum * sum - minus) / 2.0;
-        if (lid == 0 || sum > maxuper) {
+        if (stripeid == 0 || sum > maxuper) {
             maxuper = sum;
-            maxstripe = lid;
+            maxstripe = stripeid;
         }
-        if (lid == 0 || sum < minuper) {
+        if (stripeid == 0 || sum < minuper) {
             minuper = sum;
-            minstripe = lid;
+            minstripe = stripeid;
         }
-        p += stripeuper;
+        pdev += stripeuper;
     }
     printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
-    return p * spp->pgs_per_blk;
+    return pdev;
 }
-
-// static void dumpLineInfo(struct ssd* ssd, int lineid) {
-//     printf("%d[", lineid);
-//     struct ssdparams* spp = &ssd->sp;
-//     int lineblk = lineid * spp->rain_stripe_size;
-//     for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-//         int bk = line2blk[lineblk + o];
-//         assert(blk2line[bk] == lineid);
-//         int blk = bk / spp->tt_luns;
-//         int lun = (bk % spp->tt_luns) / spp->nchs;
-//         int ch = bk % spp->nchs;
-//         struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
-//         printf("(%d %d)+", bk, bl->erase_cnt);
-//     }
-//     printf("=%e] -- ", lineinfo[lineid].lineUPER);
-// }
 
 void dumpBlocks(struct ssd* ssd) {
     // printf("*************** line erase count *********************\n");
     struct ssdparams* spp = &ssd->sp;
     if (spp->rain_stripe_size > 1) {
-        LineInfo* maxfree = pqueue_peek(freeMaxPQ);
-        LineInfo* minfree = pqueue_peek(freeMinPQ);
-        LineInfo* minwritten = pqueue_peek(writtenMinPQ);
-        printf("maxfreeid %d %e minfreeid %d %e minwrittenid %d %e\n", maxfree->ln->id, maxfree->lineUPER, minfree->ln->id, minfree->lineUPER, minwritten->ln->id, minwritten->lineUPER);
-        printf("devicep %e\n", DevicePFail(ssd));
+        double p = DevicePFail(ssd);
+        printf("devicep %e\n", p);
     } else {
         struct nand_plane* pl = &ssd->ch[0].lun[0].pl[0];
-        for (int b = 0; b < ssd->sp.tt_lines; b++) {
-            int cnt = pl->blk[b].erase_cnt;
-            printf("%d ", cnt);
+        double p = 0, maxuper = 0, minuper = 0;
+        int maxstripe = 0, minstripe = 0;
+        for (int b = 0; b < spp->tt_lines; b++) {
+            double uper = UPER(pl->blk[b].erase_cnt);
+            if (b == 0 || uper > maxuper) {
+                maxuper = uper;
+                maxstripe = b;
+            }
+            if (b == 0 || uper < minuper) {
+                minuper = uper;
+                minstripe = b;
+            }
+            p += uper;
         }
+        printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
+        printf("devicep %e\n", p* spp->pgs_per_line);
     }
     // printf("\n******************************************************\n");
 }
@@ -177,6 +165,17 @@ static inline void set_rmap_ent(struct ssd* ssd, uint64_t lpn, struct ppa* ppa)
     ssd->rmap[pgidx] = lpn;
 }
 
+static inline void UpdateStripeMapping(int ppn, int targetStripe2pageIndex) {
+    int oldIndex = page2stripe[ppn];
+    if (oldIndex != targetStripe2pageIndex) {
+        int targetOldPage = stripe2page[targetStripe2pageIndex];
+        stripe2page[oldIndex] = targetOldPage;
+        stripe2page[targetStripe2pageIndex] = ppn;
+        page2stripe[targetOldPage] = oldIndex;
+        page2stripe[ppn] = targetStripe2pageIndex;
+    }
+}
+
 static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
 {
     return (next > curr);
@@ -202,61 +201,17 @@ static inline void victim_line_set_pos(void* a, size_t pos)
     ((struct line*)a)->pos = pos;
 }
 
-static inline pqueue_pri_t UPERGetPri(void* a) {
-    return *((pqueue_pri_t*)(&((LineInfo*)a)->lineUPER));
-}
-
-static inline void UPERSetPri(void* a, pqueue_pri_t pri) {
-    ((LineInfo*)a)->lineUPER = *((double*)(&pri));
-}
-
-static inline int MinCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
-    double n = *((double*)(&next)), c = *((double*)(&curr));
-    return (n > c);
-}
-
-static inline int MaxCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
-    double n = *((double*)(&next)), c = *((double*)(&curr));
-    return (n < c);
-}
-
-static inline size_t WrittenMinGetPos(void* a) {
-    return ((LineInfo*)a)->writtenMinPos;
-}
-
-static inline void WrittenMinSetPos(void* a, size_t pos) {
-    ((LineInfo*)a)->writtenMinPos = pos;
-}
-
-static inline size_t FreeMinGetPos(void* a) {
-    return ((LineInfo*)a)->freeMinPos;
-}
-
-static inline void FreeMinSetPos(void* a, size_t pos) {
-    ((LineInfo*)a)->freeMinPos = pos;
-}
-
-static inline size_t FreeMaxGetPos(void* a) {
-    return ((LineInfo*)a)->freeMaxPos;
-}
-
-static inline void FreeMaxSetPos(void* a, size_t pos) {
-    ((LineInfo*)a)->freeMaxPos = pos;
-}
-
 static void ssd_init_lines(struct ssd* ssd)
 {
     struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* line;
 
-    lm->tt_lines = spp->tt_lines;
+    lm->tt_lines = spp->blks_per_pl;
     ftl_assert(lm->tt_lines == spp->tt_lines);
     lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
 
-    if (spp->rain_stripe_size <= 1) {
-        QTAILQ_INIT(&lm->free_line_list);
-    }
+    QTAILQ_INIT(&lm->free_line_list);
     lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
         victim_line_get_pri, victim_line_set_pri,
         victim_line_get_pos, victim_line_set_pos);
@@ -270,82 +225,109 @@ static void ssd_init_lines(struct ssd* ssd)
         line->vpc = 0;
         line->pos = 0;
         /* initialize all the lines as free lines */
-        if (spp->rain_stripe_size <= 1) {
-            QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
-        }
+        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
         lm->free_line_cnt++;
     }
 
     ftl_assert(lm->free_line_cnt == lm->tt_lines);
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
-
-    if (spp->rain_stripe_size > 1) {
-        double init = UPER(0);
-        blk2line = g_malloc0(sizeof(int) * spp->tt_blks);
-        line2blk = g_malloc0(sizeof(int) * spp->tt_blks);
-        blkuper = g_malloc0(sizeof(double) * spp->tt_blks);
-        for (int i = 0;i < spp->tt_blks;i += 1) {
-            line2blk[i] = i;
-            blk2line[i] = i / spp->rain_stripe_size;
-            blkuper[i] = init;
-        }
-
-        writtenMinPQ = pqueue_init(spp->tt_lines, MinCmpPri, UPERGetPri, UPERSetPri, WrittenMinGetPos, WrittenMinSetPos);
-        freeMinPQ = pqueue_init(spp->tt_lines, MinCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
-        freeMaxPQ = pqueue_init(spp->tt_lines, MaxCmpPri, UPERGetPri, UPERSetPri, FreeMaxGetPos, FreeMaxSetPos);
-        lineinfo = g_malloc0(sizeof(LineInfo) * spp->tt_lines);
-        for (int i = 0;i < spp->tt_lines;i += 1) {
-            lineinfo[i].ln = &lm->lines[i];
-            lineinfo[i].lineUPER = init * spp->rain_stripe_size;
-            lineinfo[i].freeMaxPos = 0;
-            lineinfo[i].freeMinPos = 0;
-            lineinfo[i].writtenMinPos = 0;
-            pqueue_insert(freeMinPQ, &lineinfo[i]);
-            pqueue_insert(freeMaxPQ, &lineinfo[i]);
-        }
-        UPERsum = init * spp->tt_blks;
-
-        UPERBuffer = g_malloc0(sizeof(UPERIndex) * spp->rain_stripe_size * 2);
-    }
 }
 
 static void ssd_init_write_pointer(struct ssd* ssd)
 {
-    struct ssdparams* spp = &ssd->sp;
     struct write_pointer* wpp = &ssd->wp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* curline = NULL;
 
-    if (spp->rain_stripe_size > 1) {
-        curline = ((LineInfo*)pqueue_pop(freeMinPQ))->ln;
-        pqueue_remove(freeMaxPQ, &lineinfo[curline->id]);
-    } else {
-        curline = QTAILQ_FIRST(&lm->free_line_list);
-        QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    }
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
     lm->free_line_cnt--;
 
     /* wpp->curline is always our next-to-write super-block */
     wpp->curline = curline;
-    if (spp->rain_stripe_size > 1) {
-        int newlineblk = wpp->curline->id * spp->rain_stripe_size;
-        int newblk = line2blk[newlineblk];
-        wpp->blk = newblk / spp->tt_luns;
-        wpp->lun = (newblk % spp->tt_luns) / spp->nchs;
-        wpp->ch = newblk % spp->nchs;
-    } else {
-        wpp->ch = 0;
-        wpp->lun = 0;
-        wpp->blk = 0;
-    }
+    wpp->ch = 0;
+    wpp->lun = 0;
     wpp->pg = 0;
+    wpp->blk = 0;
     wpp->pl = 0;
 }
 
 static inline void check_addr(int a, int max)
 {
     ftl_assert(a >= 0 && a < max);
+}
+
+static struct line* get_next_free_line(struct ssd* ssd)
+{
+    struct line_mgmt* lm = &ssd->lm;
+    struct line* curline = NULL;
+
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    if (!curline) {
+        ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+        return NULL;
+    }
+
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    lm->free_line_cnt--;
+    return curline;
+}
+
+static void ssd_advance_write_pointer(struct ssd* ssd)
+{
+    struct ssdparams* spp = &ssd->sp;
+    struct write_pointer* wpp = &ssd->wp;
+    struct line_mgmt* lm = &ssd->lm;
+
+    ssdPageWrites += 1;
+
+    check_addr(wpp->ch, spp->nchs);
+    wpp->ch++;
+    if (wpp->ch == spp->nchs) {
+        wpp->ch = 0;
+        check_addr(wpp->lun, spp->luns_per_ch);
+        wpp->lun++;
+        /* in this case, we should go to next lun */
+        if (wpp->lun == spp->luns_per_ch) {
+            wpp->lun = 0;
+            /* go to next page in the block */
+            check_addr(wpp->pg, spp->pgs_per_blk);
+            wpp->pg++;
+            if (wpp->pg == spp->pgs_per_blk) {
+                wpp->pg = 0;
+                /* move current line to {victim,full} line list */
+                if (wpp->curline->vpc == spp->pgs_per_line) {
+                    /* all pgs are still valid, move to full line list */
+                    ftl_assert(wpp->curline->ipc == 0);
+                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
+                    lm->full_line_cnt++;
+                } else {
+                    ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
+                    /* there must be some invalid pages in this line */
+                    ftl_assert(wpp->curline->ipc > 0);
+                    pqueue_insert(lm->victim_line_pq, wpp->curline);
+                    lm->victim_line_cnt++;
+                }
+                /* current line is used up, pick another empty line */
+                check_addr(wpp->blk, spp->blks_per_pl);
+                wpp->curline = NULL;
+                wpp->curline = get_next_free_line(ssd);
+                if (!wpp->curline) {
+                    /* TODO */
+                    abort();
+                }
+                wpp->blk = wpp->curline->id;
+                check_addr(wpp->blk, spp->blks_per_pl);
+                /* make sure we are starting from page 0 in the super block */
+                ftl_assert(wpp->pg == 0);
+                ftl_assert(wpp->lun == 0);
+                ftl_assert(wpp->ch == 0);
+                /* TODO: assume # of pl_per_lun is 1, fix later */
+                ftl_assert(wpp->pl == 0);
+            }
+        }
+    }
 }
 
 static struct ppa get_new_page(struct ssd* ssd)
@@ -361,167 +343,6 @@ static struct ppa get_new_page(struct ssd* ssd)
     ftl_assert(ppa.g.pl == 0);
 
     return ppa;
-}
-
-static void ssd_advance_write_pointer(struct ssd* ssd);
-
-static void mark_page_valid(struct ssd* ssd, struct ppa* ppa);
-
-static uint64_t ssd_advance_status(struct ssd* ssd, struct ppa* ppa, struct
-    nand_cmd* ncmd);
-
-// same as gc_write_page except no old_ppa
-static uint64_t new_parity_write_page(struct ssd* ssd, struct ppa* new_ppa, uint64_t lpn)
-{
-    /* update maptbl */
-    // set_maptbl_ent(ssd, lpn, &new_ppa);
-    /* update rmap */
-    set_rmap_ent(ssd, lpn, new_ppa);
-
-    mark_page_valid(ssd, new_ppa);
-
-    if (ssd->sp.enable_gc_delay) {
-        struct nand_cmd gcw;
-        gcw.type = GC_IO;
-        gcw.cmd = NAND_WRITE;
-        gcw.stime = 0;
-        ssd_advance_status(ssd, new_ppa, &gcw);
-    }
-
-    parityPageWrites += 1;
-
-    return 0;
-}
-
-static struct line* get_next_free_line(struct ssd* ssd)
-{
-    struct ssdparams* spp = &ssd->sp;
-    struct line_mgmt* lm = &ssd->lm;
-    struct line* curline = NULL;
-
-    if (spp->rain_stripe_size > 1) {
-        LineInfo* lif = pqueue_peek(freeMinPQ);
-        if (!lif) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
-            return NULL;
-        }
-        curline = lif->ln;
-        pqueue_pop(freeMinPQ);
-        pqueue_remove(freeMaxPQ, lif);
-    } else {
-        curline = QTAILQ_FIRST(&lm->free_line_list);
-        if (!curline) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
-            return NULL;
-        }
-        QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    }
-
-    lm->free_line_cnt--;
-    return curline;
-}
-
-static void ssd_advance_write_pointer(struct ssd* ssd)
-{
-    struct ssdparams* spp = &ssd->sp;
-    struct write_pointer* wpp = &ssd->wp;
-    struct line_mgmt* lm = &ssd->lm;
-
-    int newlineblk = 0;
-    bool stripeFinish = false;
-    ssdPageWrites += 1;
-
-advance:
-    stripeFinish = (spp->rain_stripe_size > 1) && (currStripeOffset == spp->rain_stripe_size - 1);
-    if (stripeFinish) {
-        new_parity_write_page(ssd, &currParityPage, PARITYLPN);
-        parityReverseOffset = (parityReverseOffset + 1) % spp->rain_stripe_size;
-        ssdPageWrites += 1;
-    }
-
-    if (spp->rain_stripe_size > 1) {
-        if (stripeFinish) {
-            wpp->pg++;
-            if (wpp->pg == spp->pgs_per_blk) {
-                wpp->pg = 0;
-                /* move current line to {victim,full} line list */
-                if (wpp->curline->vpc == spp->pgs_per_line) {
-                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
-                    lm->full_line_cnt++;
-                } else {
-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
-                    lm->victim_line_cnt++;
-                }
-                pqueue_insert(writtenMinPQ, &lineinfo[wpp->curline->id]);
-                wpp->curline = get_next_free_line(ssd);
-                if (!wpp->curline) {
-                    /* TODO */
-                    abort();
-                }
-            }
-        }
-        currStripeOffset = (currStripeOffset + 1) % spp->rain_stripe_size;
-        newlineblk = wpp->curline->id * spp->rain_stripe_size + currStripeOffset;
-        int newblk = line2blk[newlineblk];
-        wpp->blk = newblk / spp->tt_luns;
-        wpp->lun = (newblk % spp->tt_luns) / spp->nchs;
-        wpp->ch = newblk % spp->nchs;
-    } else {
-        check_addr(wpp->ch, spp->nchs);
-        wpp->ch++;
-        if (wpp->ch == spp->nchs || stripeFinish) {
-            wpp->ch = 0;
-            check_addr(wpp->lun, spp->luns_per_ch);
-            wpp->lun++;
-            /* in this case, we should go to next lun */
-            if (wpp->lun == spp->luns_per_ch || stripeFinish) {
-                wpp->lun = 0;
-                /* go to next page in the block */
-                check_addr(wpp->pg, spp->pgs_per_blk);
-                wpp->pg++;
-                if (wpp->pg == spp->pgs_per_blk) {
-                    wpp->pg = 0;
-                    /* move current line to {victim,full} line list */
-                    if (wpp->curline->vpc == spp->pgs_per_line) {
-                        /* all pgs are still valid, move to full line list */
-                        ftl_assert(wpp->curline->ipc == 0);
-                        QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
-                        lm->full_line_cnt++;
-                    } else {
-                        ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
-                        /* there must be some invalid pages in this line */
-                        ftl_assert(wpp->curline->ipc > 0);
-                        pqueue_insert(lm->victim_line_pq, wpp->curline);
-                        lm->victim_line_cnt++;
-                    }
-                    /* current line is used up, pick another empty line */
-                    check_addr(wpp->blk, spp->blks_per_pl);
-                    wpp->curline = NULL;
-                    wpp->curline = get_next_free_line(ssd);
-                    if (!wpp->curline) {
-                        /* TODO */
-                        abort();
-                    }
-                    wpp->blk = wpp->curline->id;
-                    check_addr(wpp->blk, spp->blks_per_pl);
-                    /* make sure we are starting from page 0 in the super block */
-                    ftl_assert(wpp->pg == 0);
-                    // ftl_assert(wpp->lun == 0);
-                    // ftl_assert(wpp->ch == 0);
-                    /* TODO: assume # of pl_per_lun is 1, fix later */
-                    ftl_assert(wpp->pl == 0);
-                }
-            }
-        }
-    }
-
-    if (spp->rain_stripe_size > 1) {
-        if (currStripeOffset + parityReverseOffset == spp->rain_stripe_size - 1) {
-            currParityPage = get_new_page(ssd);
-            goto advance;
-        }
-    }
-
 }
 
 static void check_params(struct ssdparams* spp)
@@ -572,25 +393,20 @@ static void ssd_init_params(struct ssdparams* spp, FemuCtrl* n)
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
     /* line is special, put it at the end */
-    spp->rain_stripe_size = n->rain_stripe_size;
-    spp->pagesize = n->bb_params.secsz * n->bb_params.secs_per_pg;
-    spp->parity_start_lpn = (uint64_t)n->memsz * 1024 * 1024 / spp->pagesize;
-
-    if (spp->rain_stripe_size > 1) {
-        spp->blks_per_line = spp->rain_stripe_size;
-        spp->tt_lines = spp->tt_blks / spp->blks_per_line;
-    } else {
-        spp->blks_per_line = spp->tt_luns;
-        spp->tt_lines = spp->blks_per_lun;
-    }
+    spp->blks_per_line = spp->tt_luns; /* TODO: to fix under multiplanes */
     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
+    spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
 
     spp->gc_thres_pcent = n->bb_params.gc_thres_pcent / 100.0;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
     spp->gc_thres_pcent_high = n->bb_params.gc_thres_pcent_high / 100.0;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
     spp->enable_gc_delay = true;
+
+    spp->rain_stripe_size = n->rain_stripe_size;
+    spp->pagesize = n->bb_params.secsz * n->bb_params.secs_per_pg;
+    spp->parity_start_lpn = (uint64_t)n->memsz * 1024 * 1024 / spp->pagesize;
 
     check_params(spp);
 }
@@ -699,6 +515,37 @@ void ssd_init(FemuCtrl* n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
+    if (spp->rain_stripe_size > 1) {
+        struct ppa page;
+        page.g.ch = 0;
+        page.g.lun = 0;
+        page.g.pl = 0;
+        page.g.blk = 0;
+        page.g.pg = 0;
+        page2stripe = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+        stripe2page = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+        for (int i = 0;i < spp->tt_pgs;i += 1) {
+            uint64_t pgid = ppa2pgidx(ssd, &page);
+            stripe2page[i] = pgid;
+            page2stripe[pgid] = i;
+
+            page.g.ch += 1;
+            if (page.g.ch == spp->nchs) {
+                page.g.ch = 0;
+                page.g.lun += 1;
+                if (page.g.lun == spp->luns_per_ch) {
+                    page.g.lun = 0;
+                    page.g.pg += 1;
+                    if (page.g.pg == spp->pgs_per_blk) {
+                        page.g.pg = 0;
+                        page.g.blk += 1;
+                    }
+                }
+            }
+        }
+        assert(page.g.blk == spp->blks_per_lun);
+    }
+
     printf("finish ssd init\n");
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
@@ -758,11 +605,6 @@ static inline struct nand_block* get_blk(struct ssd* ssd, struct ppa* ppa)
 
 static inline struct line* get_line(struct ssd* ssd, struct ppa* ppa)
 {
-    if (ssd->sp.rain_stripe_size > 1) {
-        int blkindex = ssd->sp.tt_luns * ppa->g.blk + ssd->sp.nchs * ppa->g.lun + ppa->g.ch;
-        assert(blkindex < ssd->sp.tt_blks && blkindex >= 0);
-        return &(ssd->lm.lines[blk2line[blkindex]]);
-    }
     return &(ssd->lm.lines[ppa->g.blk]);
 }
 
@@ -913,7 +755,7 @@ static void mark_page_valid(struct ssd* ssd, struct ppa* ppa)
     line->vpc++;
 }
 
-static int mark_block_free(struct ssd* ssd, struct ppa* ppa)
+static void mark_block_free(struct ssd* ssd, struct ppa* ppa)
 {
     struct ssdparams* spp = &ssd->sp;
     struct nand_block* blk = get_blk(ssd, ppa);
@@ -931,8 +773,6 @@ static int mark_block_free(struct ssd* ssd, struct ppa* ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
-
-    return blk->erase_cnt;
 }
 
 static void gc_read_page(struct ssd* ssd, struct ppa* ppa)
@@ -963,10 +803,22 @@ static uint64_t gc_write_page(struct ssd* ssd, struct ppa* old_ppa)
 
     mark_page_valid(ssd, &new_ppa);
 
+    if (ssd->sp.rain_stripe_size > 1) {
+        int oldpgid = ppa2pgidx(ssd, old_ppa);
+        int newpgid = ppa2pgidx(ssd, &new_ppa);
+        // int stripeid = page2stripe[oldpgid] / ssd->sp.rain_stripe_size;
+        // int offset = page2stripe[oldpgid] % ssd->sp.rain_stripe_size;
+        // if (offset == ssd->sp.rain_stripe_size - 1) {
+        //     assert(lpn - ssd->sp.parity_start_lpn == stripeid);
+        // } else {
+        //     assert(lpn % (ssd->sp.rain_stripe_size - 1) == offset);
+        // }
+
+        UpdateStripeMapping(newpgid, page2stripe[oldpgid]);
+    }
+
     /* need to advance the write pointer here */
     ssd_advance_write_pointer(ssd);
-
-    GCPageWrites += 1;
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -988,9 +840,38 @@ static uint64_t gc_write_page(struct ssd* ssd, struct ppa* old_ppa)
     return 0;
 }
 
+// same as gc_write_page except no old_ppa
+static uint64_t new_parity_write_page(struct ssd* ssd, uint64_t lpn)
+{
+    struct ppa new_ppa = get_new_page(ssd);
+    /* update maptbl */
+    set_maptbl_ent(ssd, lpn, &new_ppa);
+    /* update rmap */
+    set_rmap_ent(ssd, lpn, &new_ppa);
+
+    mark_page_valid(ssd, &new_ppa);
+
+    int stripe_id = lpn - ssd->sp.parity_start_lpn;
+    int target = ssd->sp.rain_stripe_size * (stripe_id + 1) - 1;
+    int newpageid = ppa2pgidx(ssd, &new_ppa);
+    UpdateStripeMapping(newpageid, target);
+
+    /* need to advance the write pointer here */
+    ssd_advance_write_pointer(ssd);
+
+    if (ssd->sp.enable_gc_delay) {
+        struct nand_cmd gcw;
+        gcw.type = GC_IO;
+        gcw.cmd = NAND_WRITE;
+        gcw.stime = 0;
+        ssd_advance_status(ssd, &new_ppa, &gcw);
+    }
+
+    return 0;
+}
+
 static struct line* select_victim_line(struct ssd* ssd, bool force)
 {
-    struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* victim_line = NULL;
 
@@ -1006,10 +887,6 @@ static struct line* select_victim_line(struct ssd* ssd, bool force)
     pqueue_pop(lm->victim_line_pq);
     victim_line->pos = 0;
     lm->victim_line_cnt--;
-
-    if (spp->rain_stripe_size > 1) {
-        pqueue_remove(writtenMinPQ, &lineinfo[victim_line->id]);
-    }
 
     /* victim_line is a danggling node now */
     return victim_line;
@@ -1027,10 +904,12 @@ static void clean_one_block(struct ssd* ssd, struct ppa* ppa)
         pg_iter = get_pg(ssd, ppa);
         /* there shouldn't be any free page in victim blocks */
         ftl_assert(pg_iter->status != PG_FREE);
-        if (pg_iter->status == PG_VALID && get_rmap_ent(ssd, ppa) != PARITYLPN) {
+        if (pg_iter->status == PG_VALID) {
             gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
             gc_write_page(ssd, ppa);
+            set_rmap_ent(ssd, INVALID_LPN, ppa);
+            GCPageWrites += 1;
             cnt++;
         }
     }
@@ -1038,211 +917,41 @@ static void clean_one_block(struct ssd* ssd, struct ppa* ppa)
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
 }
 
-static void InsSort(UPERIndex* arr, int size) {
-    int i, j;
-    UPERIndex tmp;
-    for (i = 1; i < size; i++) {
-        if (arr[i].uper < arr[i - 1].uper) {
-            tmp = arr[i];
-            for (j = i - 1; j >= 0 && arr[j].uper > tmp.uper; j--) {
-                arr[j + 1] = arr[j];
-            }
-            arr[j + 1] = tmp;
-        }
-    }
-}
-
-static void SwapFreeStripe(struct ssd* ssd, LineInfo* a, LineInfo* b) {
-    struct ssdparams* spp = &ssd->sp;
-    double sum = a->lineUPER + b->lineUPER;
-    double target = sum / 2;
-    int alineblk = a->ln->id * spp->rain_stripe_size;
-    for (int i = 0;i < spp->rain_stripe_size;i += 1) {
-        int blk = line2blk[alineblk + i];
-        UPERBuffer[i].blkid = blk;
-        UPERBuffer[i].uper = blkuper[blk];
-        UPERBuffer[i].chosen = false;
-    }
-    int blineblk = b->ln->id * spp->rain_stripe_size;
-    for (int i = 0;i < spp->rain_stripe_size;i += 1) {
-        int blk = line2blk[blineblk + i];
-        UPERBuffer[i + spp->rain_stripe_size].blkid = blk;
-        UPERBuffer[i + spp->rain_stripe_size].uper = blkuper[blk];
-        UPERBuffer[i + spp->rain_stripe_size].chosen = false;
-    }
-    InsSort(UPERBuffer, spp->rain_stripe_size * 2);
-
-    int head = 0, tail = spp->rain_stripe_size * 2 - 1;
-    double stripesum = 0;
-    int j = 0;
-    for (;j < spp->rain_stripe_size - 1;j++) {
-        UPERBuffer[tail].chosen = true;
-        stripesum += UPERBuffer[tail].uper;
-        tail--;
-        if (stripesum + UPERBuffer[tail].uper > target) {
-            j++;
-            break;
-        }
-    }
-    for (;j < spp->rain_stripe_size - 1;j++) {
-        UPERBuffer[head].chosen = true;
-        stripesum += UPERBuffer[head].uper;
-        head++;
-    }
-
-    double delta = 1 + sum, lasttarget = target - stripesum;
-    int k = head;
-    for (;k <= tail;k++) {
-        double d = fabs(UPERBuffer[k].uper - lasttarget);
-        if (d >= delta) {
-            break;
-        }
-        delta = d;
-    }
-    k -= 1;
-    UPERBuffer[k].chosen = true;
-
-    head = tail = 0;
-    a->lineUPER = b->lineUPER = 0;
-    for (int i = 0;i < spp->rain_stripe_size * 2;i += 1) {
-        if (UPERBuffer[i].chosen) {
-            line2blk[alineblk + head] = UPERBuffer[i].blkid;
-            blk2line[UPERBuffer[i].blkid] = a->ln->id;
-            blkuper[UPERBuffer[i].blkid] = UPERBuffer[i].uper;
-            a->lineUPER += UPERBuffer[i].uper;
-            head += 1;
-        } else {
-            line2blk[blineblk + tail] = UPERBuffer[i].blkid;
-            blk2line[UPERBuffer[i].blkid] = b->ln->id;
-            blkuper[UPERBuffer[i].blkid] = UPERBuffer[i].uper;
-            b->lineUPER += UPERBuffer[i].uper;
-            tail += 1;
-        }
-    }
-    assert(head == tail && head == spp->rain_stripe_size);
-}
-
-static int do_gc(struct ssd* ssd, bool force, struct line* victim_line);
-
-static void ClearFullStripe(struct ssd* ssd, LineInfo* full) {
-    struct ssdparams* spp = &ssd->sp;
-    struct line_mgmt* lm = &ssd->lm;
-    struct line* clearline = full->ln;
-    if (clearline->vpc == spp->pgs_per_line) {
-        assert(clearline->pos == 0);
-        QTAILQ_REMOVE(&lm->full_line_list, clearline, entry);
-        lm->full_line_cnt--;
-    } else {
-        assert(clearline->pos > 0);
-        pqueue_remove(lm->victim_line_pq, clearline);
-        clearline->pos = 0;
-        lm->victim_line_cnt--;
-    }
-    do_gc(ssd, false, clearline);
-}
-
-static void mark_line_free(struct ssd* ssd, struct ppa* ppa, bool clean)
+static void mark_line_free(struct ssd* ssd, struct ppa* ppa)
 {
-    struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* line = get_line(ssd, ppa);
-
     line->ipc = 0;
     line->vpc = 0;
     /* move this line to free line list */
-    if (spp->rain_stripe_size > 1) {
-        if (clean) {
-            LineInfo* curr = &lineinfo[line->id];
-            LineInfo* maxfree;
-            maxfree = pqueue_peek(freeMaxPQ);
-            if (!maxfree) {
-                ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
-            }
-            if (curr->lineUPER > maxfree->lineUPER) {
-                pqueue_pop(freeMaxPQ);
-                pqueue_remove(freeMinPQ, maxfree);
-                SwapFreeStripe(ssd, maxfree, curr);
-                swapFreeCount += 1;
-                pqueue_insert(freeMinPQ, maxfree);
-                pqueue_insert(freeMaxPQ, maxfree);
-            }
-
-            pqueue_insert(freeMinPQ, curr);
-            pqueue_insert(freeMaxPQ, curr);
-
-            maxfree = pqueue_peek(freeMaxPQ);
-            LineInfo* minwritten = pqueue_peek(writtenMinPQ);
-            if (minwritten != NULL && maxfree->lineUPER > minwritten->lineUPER * 2) {
-                pqueue_pop(writtenMinPQ);
-                pqueue_pop(freeMaxPQ);
-                pqueue_remove(freeMinPQ, maxfree);
-                ClearFullStripe(ssd, minwritten);
-                clearFullCount += 1;
-                SwapFreeStripe(ssd, minwritten, maxfree);
-                pqueue_insert(freeMinPQ, maxfree);
-                pqueue_insert(freeMaxPQ, maxfree);
-                pqueue_insert(freeMinPQ, minwritten);
-                pqueue_insert(freeMaxPQ, minwritten);
-            }
-        }
-    } else {
-        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
-    }
+    QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
 }
 
-static int do_gc(struct ssd* ssd, bool force, struct line* victim_line)
+static int do_gc(struct ssd* ssd, bool force)
 {
-    // struct line* victim_line = NULL;
-    bool clean = !victim_line;
+    struct line* victim_line = NULL;
     struct ssdparams* spp = &ssd->sp;
     struct nand_lun* lunp;
     struct ppa ppa;
+    int ch, lun;
 
-    if (clean) {
-        victim_line = select_victim_line(ssd, force);
-    }
+    victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
         return -1;
     }
 
-    ppa.g.pl = 0;
     ppa.g.blk = victim_line->id;
-    ppa.g.lun = 0;
-    ppa.g.ch = 0;
-    int currblk = 0;
-    if (spp->rain_stripe_size > 1) {
-        double oldUPER = lineinfo[victim_line->id].lineUPER, newUPER = 0.0;
-        int newlineblk = victim_line->id * spp->rain_stripe_size;
-        while (currblk < spp->blks_per_line) {
-            int newblk = line2blk[newlineblk];
-            ppa.g.blk = newblk / spp->tt_luns;
-            ppa.g.lun = (newblk % spp->tt_luns) / spp->nchs;
-            ppa.g.ch = newblk % spp->nchs;
+    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+        victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
+        ssd->lm.free_line_cnt);
 
-            lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
-            int newcnt = mark_block_free(ssd, &ppa);
-            blkuper[newblk] = UPER(newcnt);
-            newUPER += blkuper[newblk];
-
-            if (spp->enable_gc_delay) {
-                struct nand_cmd gce;
-                gce.type = GC_IO;
-                gce.cmd = NAND_ERASE;
-                gce.stime = 0;
-                ssd_advance_status(ssd, &ppa, &gce);
-            }
-
-            lunp->gc_endtime = lunp->next_lun_avail_time;
-
-            currblk += 1;
-            newlineblk += 1;
-        }
-        lineinfo[victim_line->id].lineUPER = newUPER;
-        UPERsum += (newUPER - oldUPER);
-    } else {
-        while (currblk < spp->blks_per_line) {
+    /* copy back valid data */
+    for (ch = 0; ch < spp->nchs; ch++) {
+        for (lun = 0; lun < spp->luns_per_ch; lun++) {
+            ppa.g.ch = ch;
+            ppa.g.lun = lun;
+            ppa.g.pl = 0;
             lunp = get_lun(ssd, &ppa);
             clean_one_block(ssd, &ppa);
             mark_block_free(ssd, &ppa);
@@ -1256,29 +965,17 @@ static int do_gc(struct ssd* ssd, bool force, struct line* victim_line)
             }
 
             lunp->gc_endtime = lunp->next_lun_avail_time;
-
-            currblk += 1;
-            if (currblk < spp->blks_per_line) {
-                ppa.g.ch += 1;
-                if (ppa.g.ch == spp->nchs) {
-                    ppa.g.lun += 1;
-                    ppa.g.ch = 0;
-                }
-            }
         }
     }
 
     /* update line status */
-    mark_line_free(ssd, &ppa, clean);
-
-    // printf("marked free\n");
+    mark_line_free(ssd, &ppa);
 
     gcCount += 1;
     if (gcCount % spp->tt_lines == 0) {
         int cycles = gcCount / spp->tt_lines;
         if (cycles % 50 == 0) {
-            printf("\nupersum %e target %e\n", UPERsum, UPERsum / spp->tt_lines);
-            printf("cycles %d gccount %d swapfree %d clearfull %d\n", cycles, gcCount, swapFreeCount, clearFullCount);
+            printf("\ncycles %d gccount %d\n", cycles, gcCount);
             printf("hostpages %lu ssdpages %lu gcpages %lu paritypages %lu WAF %e\n", hostPageWrites, ssdPageWrites, GCPageWrites, parityPageWrites, (double)ssdPageWrites / hostPageWrites);
             dumpBlocks(ssd);
         }
@@ -1355,7 +1052,7 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
 
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ssd, true, NULL);
+        r = do_gc(ssd, true);
         if (r == -1)
             break;
     }
@@ -1363,34 +1060,38 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
 
     // printf("\n[ SSD ]\nwrite lpn: %lu~%lu, ppa(ch, lun, blk, pg): ", start_lpn, end_lpn);
 
-    // int in_stripe_lpn = 0;
-    // bool partial = false;
+    int in_stripe_lpn = 0;
+    bool partial = false;
+    int stripe_id = 0, parity_lpn = 0;
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 
 
         // printf("%lu(", lpn);
-        // if (spp->rain_stripe_size > 1) {
-        //     in_stripe_lpn = lpn % (spp->rain_stripe_size - 1);
-        //     partial = (lpn - in_stripe_lpn < start_lpn) || (lpn + spp->rain_stripe_size - 2 - in_stripe_lpn > end_lpn);
-        // }
+        if (spp->rain_stripe_size > 1) {
+            in_stripe_lpn = lpn % (spp->rain_stripe_size - 1);
+            stripe_id = lpn / (spp->rain_stripe_size - 1);
+            parity_lpn = spp->parity_start_lpn + stripe_id;
+            partial = (lpn - in_stripe_lpn < start_lpn) || (lpn + spp->rain_stripe_size - 2 - in_stripe_lpn > end_lpn);
+        }
 
 
-        ppa = get_maptbl_ent(ssd, lpn);
-        if (mapped_ppa(&ppa)) {
+        struct ppa oldppa = get_maptbl_ent(ssd, lpn);
+        ppa = get_new_page(ssd);
+        if (mapped_ppa(&oldppa)) {
 
 
             // printf("%d, %d, %d, %d)->(", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
-            // if (spp->rain_stripe_size > 1 && partial) {
-            //     gc_read_page(ssd, &ppa);
-            // }
+            if (spp->rain_stripe_size > 1 && partial) {
+                gc_read_page(ssd, &oldppa);
+            }
 
             /* update old page information first */
-            mark_page_invalid(ssd, &ppa);
-            set_rmap_ent(ssd, INVALID_LPN, &ppa);
+            mark_page_invalid(ssd, &oldppa);
+            set_rmap_ent(ssd, INVALID_LPN, &oldppa);
         }
 
         /* new write */
-        ppa = get_new_page(ssd);
+        // ppa = get_new_page(ssd);
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
@@ -1413,25 +1114,28 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
 
-        // if (spp->rain_stripe_size > 1) {
-        //     if ((in_stripe_lpn == spp->rain_stripe_size - 2) || lpn == end_lpn) {
-        //         uint64_t stripe_id = lpn / (spp->rain_stripe_size - 1);
-        //         uint64_t parity_lpn = spp->parity_start_lpn + stripe_id;
-        //         ppa = get_maptbl_ent(ssd, parity_lpn);
-        //         if (mapped_ppa(&ppa)) {
-        //             if (partial) {
-        //                 gc_read_page(ssd, &ppa);
-        //             }
-        //             gc_write_page(ssd, &ppa);
-        //             mark_page_invalid(ssd, &ppa);
-        //             set_rmap_ent(ssd, INVALID_LPN, &ppa);
-        //         } else {
-        //             new_parity_write_page(ssd, parity_lpn);
-        //         }
+        if (spp->rain_stripe_size > 1) {
+            int target = stripe_id * spp->rain_stripe_size + in_stripe_lpn;
+            int newpageid = ppa2pgidx(ssd, &ppa);
+            UpdateStripeMapping(newpageid, target);
 
-        //         // printf("[parity lpn: %lu+%lu], ", spp->parity_start_lpn, stripe_id);
-        //     }
-        // }
+            if ((in_stripe_lpn == spp->rain_stripe_size - 2) || lpn == end_lpn) {
+                ppa = get_maptbl_ent(ssd, parity_lpn);
+                if (mapped_ppa(&ppa)) {
+                    if (partial) {
+                        gc_read_page(ssd, &ppa);
+                    }
+                    gc_write_page(ssd, &ppa);
+                    mark_page_invalid(ssd, &ppa);
+                    set_rmap_ent(ssd, INVALID_LPN, &ppa);
+                } else {
+                    new_parity_write_page(ssd, parity_lpn);
+                }
+                parityPageWrites += 1;
+
+                // printf("[parity lpn: %lu+%lu], ", spp->parity_start_lpn, stripe_id);
+            }
+        }
     }
 
     hostPageWrites += end_lpn - start_lpn + 1;
@@ -1496,7 +1200,7 @@ static void* ftl_thread(void* arg)
 
             /* clean one line if needed (in the background) */
             if (should_gc(ssd)) {
-                do_gc(ssd, false, NULL);
+                do_gc(ssd, false);
             }
         }
     }

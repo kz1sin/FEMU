@@ -806,8 +806,8 @@ static uint64_t gc_write_page(struct ssd* ssd, struct ppa* old_ppa)
     if (ssd->sp.rain_stripe_size > 1) {
         int oldpgid = ppa2pgidx(ssd, old_ppa);
         int newpgid = ppa2pgidx(ssd, &new_ppa);
-        int stripeid = page2stripe[oldpgid] / ssd->sp.rain_stripe_size;
-        int offset = page2stripe[oldpgid] % ssd->sp.rain_stripe_size;
+        // int stripeid = page2stripe[oldpgid] / ssd->sp.rain_stripe_size;
+        // int offset = page2stripe[oldpgid] % ssd->sp.rain_stripe_size;
         // if (offset == ssd->sp.rain_stripe_size - 1) {
         //     assert(lpn - ssd->sp.parity_start_lpn == stripeid);
         // } else {
