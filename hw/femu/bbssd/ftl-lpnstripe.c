@@ -1147,6 +1147,75 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
     return maxlat;
 }
 
+static QemuThread trace_thread;
+
+static void* trace(void* arg) {
+    sleep(30);
+    FemuCtrl* n = (FemuCtrl*)arg;
+    struct ssd* ssd = n->ssd;
+
+    // FILE* fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/writeoffsetlen.txt", "r");
+    FILE* fp;
+    // fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk450size20G.txt", "r");
+    uint64_t offset = 0, len = 0;
+    // uint64_t totalsize = 0, targetsize = (uint64_t)n->memsz * 1024 * 1024;
+    // int res = fscanf(fp, "%lu", &totalsize);
+    // assert(res > 0);
+    // double ratio = (double)totalsize / targetsize;
+    NvmeRequest rq;
+    rq.stime = 0;
+
+    // int prefillmb = n->memsz * 9 / 10;
+    // for (int mb = 0;mb < prefillmb;mb += 1) {
+    //     offset = (uint64_t)mb * 1024 * 1024;
+    //     len = 1024 * 1024;
+    //     // if (targetsize - offset < len) {
+    //     //     len = targetsize - offset;
+    //     // }
+    //     rq.slba = offset / ssd->sp.secsz;
+    //     rq.nlb = len / ssd->sp.secsz;
+
+    //     ssd_write(ssd, &rq);
+    //     if (should_gc(ssd)) {
+    //         do_gc(ssd, false);
+    //     }
+    // }
+    // printf("\ntotal %lu target %lu ratio %lf prefill %lu\n", totalsize, targetsize, ratio, (uint64_t)prefillmb * 1024 * 1024);
+
+    fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk477size20Greadprefill.txt", "r");
+    while (fscanf(fp, "%lu %lu", &offset, &len) != EOF) {
+        rq.slba = offset / ssd->sp.secsz;
+        rq.nlb = len / ssd->sp.secsz;
+
+        ssd_write(ssd, &rq);
+        if (should_gc(ssd)) {
+            do_gc(ssd, false);
+        }
+    }
+    fclose(fp);
+
+    while (1) {
+        fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk477size20Gwrite.txt", "r");
+        while (fscanf(fp, "%lu %lu", &offset, &len) != EOF) {
+            // offset = (uint64_t)(offset / ratio) & (~4095);
+            // len = (len + 4095) & (~4095);
+            // if (targetsize - offset < len) {
+            //     len = targetsize - offset;
+            // }
+            rq.slba = offset / ssd->sp.secsz;
+            rq.nlb = len / ssd->sp.secsz;
+
+            ssd_write(ssd, &rq);
+            if (should_gc(ssd)) {
+                do_gc(ssd, false);
+            }
+        }
+        fclose(fp);
+    }
+
+    return NULL;
+}
+
 static void* ftl_thread(void* arg)
 {
     FemuCtrl* n = (FemuCtrl*)arg;
@@ -1163,6 +1232,8 @@ static void* ftl_thread(void* arg)
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
+
+    qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
 
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {

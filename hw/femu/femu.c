@@ -543,6 +543,10 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
 
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
 
+    if (bs_size > 8ul * 1024 * 1024 * 1024) {
+        bs_size = 8ul * 1024 * 1024 * 1024;
+    }
+
     int ps = n->bb_params.secsz * n->bb_params.secs_per_pg;
     init_dram_backend(&n->mbe, bs_size, n->rain_stripe_size, ps);
     n->mbe->femu_mode = n->femu_mode;
