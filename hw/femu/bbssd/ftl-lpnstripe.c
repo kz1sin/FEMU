@@ -6,10 +6,14 @@
 static int gcCount = 0;
 static uint64_t hostPageWrites = 0, ssdPageWrites = 0, GCPageWrites = 0, parityPageWrites = 0;
 static int* page2stripe, * stripe2page;
+static double currErrorRate = 0;
+static const double targetErrorRate = 1e-5;
+static FILE* outfp;
 
-static const double K = 1.7437012;
-static const double ALPHA = 4.5326348e-13;
-static const double EPSILON = 7.2282898e-07;
+static const double K = 2.05;
+static const double ALPHA = 3.9e-10;
+static const double EPSILON = 1.48e-3;
+static const int ECC = 128;
 
 static inline double RBER(int cycle) {
     return EPSILON + ALPHA * pow(cycle, K);
@@ -17,18 +21,17 @@ static inline double RBER(int cycle) {
 
 static double UPER(int cycle) {
     const int BITS = 4096 * 8;
-    const int ECC = 8;
 
     double rber = RBER(cycle);
     double combin = 1;
     for (int i = 1;i <= ECC + 1;i++) {
-        combin *= (double)(BITS - i + 1) / i;
+        combin *= rber * (BITS - i + 1) / i;
     }
-    double currTerm = combin * pow(rber, ECC + 1) * pow(1 - rber, BITS - ECC - 1);
+    double currTerm = combin * pow(1 - rber, BITS - ECC - 1);
     double pe = currTerm;
     for (int i = ECC + 2;i <= BITS;i++) {
-        double mul = (double)(BITS - i + 1) * rber / (1 - rber) / i;
-        if (mul <= 1e-2) {
+        double mul = rber * (BITS - i + 1) / i / (1 - rber);
+        if (mul <= 0.5 && currTerm <= pe * 0.005) {
             break;
         }
         currTerm *= mul;
@@ -79,16 +82,56 @@ static double DevicePFail(struct ssd* ssd) {
         }
         pdev += stripeuper;
     }
-    printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
+    fprintf(outfp, "maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
     return pdev;
 }
 
+static void DumpEraseCount(struct ssd* ssd) {
+    struct ssdparams* spp = &ssd->sp;
+    fprintf(outfp, "\n");
+    for (int blkid = 0; blkid < spp->tt_blks; blkid++) {
+        int blk = blkid / spp->tt_luns;
+        int lun = (blkid % spp->tt_luns) / spp->nchs;
+        int ch = blkid % spp->nchs;
+        struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
+        fprintf(outfp, "%d ", bl->erase_cnt);
+        if (blkid % 8 == 7) {
+            fprintf(outfp, "\n");
+            fflush(outfp);
+        }
+    }
+    fprintf(outfp, "\nstripespervalue 1\n");
+    int totalstripes = spp->tt_pgs / spp->rain_stripe_size;
+    for (int stripeid = 0; stripeid < totalstripes; stripeid += 1) {
+        double minus = 0, sum = 0;
+        for (int offset = 0;offset < spp->rain_stripe_size;offset += 1) {
+            int pageid = stripe2page[stripeid * spp->rain_stripe_size + offset];
+            int ch = pageid / spp->pgs_per_ch;
+            int lun = (pageid % spp->pgs_per_ch) / spp->pgs_per_lun;
+            int blk = (pageid % spp->pgs_per_pl) / spp->pgs_per_blk;
+            struct nand_block* bl = &ssd->ch[ch].lun[lun].pl[0].blk[blk];
+            double uper = UPER(bl->erase_cnt);
+            sum += uper;
+            minus += uper * uper;
+        }
+        double stripeuper = (sum * sum - minus) / 2.0;
+        fprintf(outfp, "%e ", stripeuper);
+        if (stripeid % 8 == 7) {
+            fprintf(outfp, "\n");
+            fflush(outfp);
+        }
+    }
+    fprintf(outfp, "\n");
+}
+
 void dumpBlocks(struct ssd* ssd) {
-    // printf("*************** line erase count *********************\n");
     struct ssdparams* spp = &ssd->sp;
     if (spp->rain_stripe_size > 1) {
-        double p = DevicePFail(ssd);
-        printf("devicep %e\n", p);
+        currErrorRate = DevicePFail(ssd);
+        fprintf(outfp, "devicep %e\n", currErrorRate);
+        if (currErrorRate >= targetErrorRate) {
+            DumpEraseCount(ssd);
+        }
     } else {
         struct nand_plane* pl = &ssd->ch[0].lun[0].pl[0];
         double p = 0, maxuper = 0, minuper = 0;
@@ -105,10 +148,18 @@ void dumpBlocks(struct ssd* ssd) {
             }
             p += uper;
         }
-        printf("maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
-        printf("devicep %e\n", p* spp->pgs_per_line);
+        fprintf(outfp, "maxstripe %d %e minstripe %d %e\n", maxstripe, maxuper, minstripe, minuper);
+        currErrorRate = p * spp->pgs_per_line;
+        fprintf(outfp, "devicep %e\n", currErrorRate);
+        if (currErrorRate >= targetErrorRate) {
+            fprintf(outfp, "\n");
+            for (int b = 0; b < ssd->sp.tt_lines; b++) {
+                int cnt = pl->blk[b].erase_cnt;
+                fprintf(outfp, "%d ", cnt);
+            }
+            fprintf(outfp, "\n");
+        }
     }
-    // printf("\n******************************************************\n");
 }
 
 static void* ftl_thread(void* arg);
@@ -487,9 +538,6 @@ static void ssd_init_rmap(struct ssd* ssd)
 
 void ssd_init(FemuCtrl* n)
 {
-
-    printf("start ssd init\n");
-
     struct ssd* ssd = n->ssd;
     struct ssdparams* spp = &ssd->sp;
 
@@ -545,8 +593,6 @@ void ssd_init(FemuCtrl* n)
         }
         assert(page.g.blk == spp->blks_per_lun);
     }
-
-    printf("finish ssd init\n");
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
         QEMU_THREAD_JOINABLE);
@@ -974,10 +1020,11 @@ static int do_gc(struct ssd* ssd, bool force)
     gcCount += 1;
     if (gcCount % spp->tt_lines == 0) {
         int cycles = gcCount / spp->tt_lines;
-        if (cycles % 50 == 0) {
-            printf("\ncycles %d gccount %d\n", cycles, gcCount);
-            printf("hostpages %lu ssdpages %lu gcpages %lu paritypages %lu WAF %e\n", hostPageWrites, ssdPageWrites, GCPageWrites, parityPageWrites, (double)ssdPageWrites / hostPageWrites);
+        if (cycles % 10 == 0) {
+            fprintf(outfp, "\ncycles %d gccount %d\n", cycles, gcCount);
+            fprintf(outfp, "hostpages %lu ssdpages %lu gcpages %lu paritypages %lu WAF %e\n", hostPageWrites, ssdPageWrites, GCPageWrites, parityPageWrites, (double)ssdPageWrites / hostPageWrites);
             dumpBlocks(ssd);
+            fflush(outfp);
         }
     }
 
@@ -999,23 +1046,10 @@ static uint64_t ssd_read(struct ssd* ssd, NvmeRequest* req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-
-    // printf("\n[ SSD ]\nread lpn: %lu~%lu, ppa(ch, lun, blk, pg): ", start_lpn, end_lpn);
-
-
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);
-
-
-        // printf("%lu(", lpn);
-        // printf("%d, %d, %d, %d), ", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
-
-
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
 
@@ -1026,10 +1060,6 @@ static uint64_t ssd_read(struct ssd* ssd, NvmeRequest* req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
-
-
-    // printf("\n\n");
-
 
     return maxlat;
 }
@@ -1057,16 +1087,10 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
             break;
     }
 
-
-    // printf("\n[ SSD ]\nwrite lpn: %lu~%lu, ppa(ch, lun, blk, pg): ", start_lpn, end_lpn);
-
     int in_stripe_lpn = 0;
     bool partial = false;
     int stripe_id = 0, parity_lpn = 0;
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-
-
-        // printf("%lu(", lpn);
         if (spp->rain_stripe_size > 1) {
             in_stripe_lpn = lpn % (spp->rain_stripe_size - 1);
             stripe_id = lpn / (spp->rain_stripe_size - 1);
@@ -1074,13 +1098,9 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
             partial = (lpn - in_stripe_lpn < start_lpn) || (lpn + spp->rain_stripe_size - 2 - in_stripe_lpn > end_lpn);
         }
 
-
         struct ppa oldppa = get_maptbl_ent(ssd, lpn);
         ppa = get_new_page(ssd);
         if (mapped_ppa(&oldppa)) {
-
-
-            // printf("%d, %d, %d, %d)->(", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
             if (spp->rain_stripe_size > 1 && partial) {
                 gc_read_page(ssd, &oldppa);
             }
@@ -1098,10 +1118,6 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
         set_rmap_ent(ssd, lpn, &ppa);
 
         mark_page_valid(ssd, &ppa);
-
-
-        // printf("%d, %d, %d, %d), ", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
-
 
         /* need to advance the write pointer here */
         ssd_advance_write_pointer(ssd);
@@ -1132,19 +1148,102 @@ static uint64_t ssd_write(struct ssd* ssd, NvmeRequest* req)
                     new_parity_write_page(ssd, parity_lpn);
                 }
                 parityPageWrites += 1;
-
-                // printf("[parity lpn: %lu+%lu], ", spp->parity_start_lpn, stripe_id);
             }
         }
     }
-
     hostPageWrites += end_lpn - start_lpn + 1;
 
-    // struct write_pointer* wpp = &ssd->wp;
-    // printf("\nadvanced write pointer(ch, lun, blk, pg): (%d, %d, %d, %d)\n\n", wpp->ch, wpp->lun, wpp->blk, wpp->pg);
-
-
     return maxlat;
+}
+
+static void ResetState(struct ssd* ssd) {
+    struct ssdparams* spp = &ssd->sp;
+    for (int i = 0; i < spp->nchs; i++) {
+        struct ssd_channel* ch = &ssd->ch[i];
+        for (int j = 0; j < ch->nluns; j++) {
+            struct nand_lun* lun = &ch->lun[j];
+            for (int k = 0; k < lun->npls; k++) {
+                struct nand_plane* pl = &lun->pl[k];
+                for (int l = 0; l < pl->nblks; l++) {
+                    struct nand_block* blk = &pl->blk[l];
+                    for (int m = 0; m < blk->npgs; m++) {
+                        struct nand_page* pg = &blk->pg[m];
+                        for (int n = 0; n < pg->nsecs; n++) {
+                            pg->sec[n] = SEC_FREE;
+                        }
+                        pg->status = PG_FREE;
+                    }
+                    blk->ipc = 0;
+                    blk->vpc = 0;
+                    blk->erase_cnt = 0;
+                    blk->wp = 0;
+                }
+            }
+            lun->next_lun_avail_time = 0;
+            lun->busy = false;
+        }
+        ch->next_ch_avail_time = 0;
+        ch->busy = 0;
+    }
+
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->maptbl[i].ppa = UNMAPPED_PPA;
+        ssd->rmap[i] = INVALID_LPN;
+    }
+
+    struct line_mgmt* lm = &ssd->lm;
+    struct line* line;
+    QTAILQ_INIT(&lm->free_line_list);
+    lm->victim_line_pq->size = 1;
+    QTAILQ_INIT(&lm->full_line_list);
+
+    lm->free_line_cnt = lm->tt_lines;
+    lm->victim_line_cnt = 0;
+    lm->full_line_cnt = 0;
+    for (int i = 0; i < lm->tt_lines; i++) {
+        line = &lm->lines[i];
+        line->id = i;
+        line->ipc = 0;
+        line->vpc = 0;
+        line->pos = 0;
+        /* initialize all the lines as free lines */
+        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+    }
+
+    ssd_init_write_pointer(ssd);
+
+    if (spp->rain_stripe_size > 1) {
+        struct ppa page;
+        page.g.ch = 0;
+        page.g.lun = 0;
+        page.g.pl = 0;
+        page.g.blk = 0;
+        page.g.pg = 0;
+        for (int i = 0;i < spp->tt_pgs;i += 1) {
+            uint64_t pgid = ppa2pgidx(ssd, &page);
+            stripe2page[i] = pgid;
+            page2stripe[pgid] = i;
+
+            page.g.ch += 1;
+            if (page.g.ch == spp->nchs) {
+                page.g.ch = 0;
+                page.g.lun += 1;
+                if (page.g.lun == spp->luns_per_ch) {
+                    page.g.lun = 0;
+                    page.g.pg += 1;
+                    if (page.g.pg == spp->pgs_per_blk) {
+                        page.g.pg = 0;
+                        page.g.blk += 1;
+                    }
+                }
+            }
+        }
+        assert(page.g.blk == spp->blks_per_lun);
+    }
+
+    gcCount = 0;
+    hostPageWrites = ssdPageWrites = GCPageWrites = parityPageWrites = 0;
+    currErrorRate = 0;
 }
 
 static QemuThread trace_thread;
@@ -1153,55 +1252,28 @@ static void* trace(void* arg) {
     sleep(30);
     FemuCtrl* n = (FemuCtrl*)arg;
     struct ssd* ssd = n->ssd;
-
-    // FILE* fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/writeoffsetlen.txt", "r");
-    FILE* fp;
-    // fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk450size20G.txt", "r");
     uint64_t offset = 0, len = 0;
-    // uint64_t totalsize = 0, targetsize = (uint64_t)n->memsz * 1024 * 1024;
-    // int res = fscanf(fp, "%lu", &totalsize);
-    // assert(res > 0);
-    // double ratio = (double)totalsize / targetsize;
     NvmeRequest rq;
     rq.stime = 0;
 
-    // int prefillmb = n->memsz * 9 / 10;
-    // for (int mb = 0;mb < prefillmb;mb += 1) {
-    //     offset = (uint64_t)mb * 1024 * 1024;
-    //     len = 1024 * 1024;
-    //     // if (targetsize - offset < len) {
-    //     //     len = targetsize - offset;
-    //     // }
-    //     rq.slba = offset / ssd->sp.secsz;
-    //     rq.nlb = len / ssd->sp.secsz;
+    char buf[256];
+    sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/diskids%d", n->tracediskGB, n->tracefile);
+    printf("tracefile %s\n", buf);
 
-    //     ssd_write(ssd, &rq);
-    //     if (should_gc(ssd)) {
-    //         do_gc(ssd, false);
-    //     }
-    // }
-    // printf("\ntotal %lu target %lu ratio %lf prefill %lu\n", totalsize, targetsize, ratio, (uint64_t)prefillmb * 1024 * 1024);
-
-    fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk477size20Greadprefill.txt", "r");
-    while (fscanf(fp, "%lu %lu", &offset, &len) != EOF) {
-        rq.slba = offset / ssd->sp.secsz;
-        rq.nlb = len / ssd->sp.secsz;
-
-        ssd_write(ssd, &rq);
-        if (should_gc(ssd)) {
-            do_gc(ssd, false);
+    int diskid = 0;
+    FILE* fp = fopen(buf, "r");
+    while (fscanf(fp, "%d", &diskid) != EOF) {
+        if (n->rain_stripe_size > 1) {
+            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/disk%dprefillLPNBaseline%d+1", n->tracediskGB, diskid, n->rain_stripe_size - 1);
+        } else {
+            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/disk%dprefillECC", n->tracediskGB, diskid);
         }
-    }
-    fclose(fp);
+        outfp = fopen(buf, "w");
+        printf("outfile %s\n", buf);
 
-    while (1) {
-        fp = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/disk477size20Gwrite.txt", "r");
-        while (fscanf(fp, "%lu %lu", &offset, &len) != EOF) {
-            // offset = (uint64_t)(offset / ratio) & (~4095);
-            // len = (len + 4095) & (~4095);
-            // if (targetsize - offset < len) {
-            //     len = targetsize - offset;
-            // }
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/readprefill/disk%d", n->tracediskGB, diskid);
+        FILE* fpin = fopen(buf, "r");
+        while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
             rq.slba = offset / ssd->sp.secsz;
             rq.nlb = len / ssd->sp.secsz;
 
@@ -1210,8 +1282,47 @@ static void* trace(void* arg) {
                 do_gc(ssd, false);
             }
         }
-        fclose(fp);
+        fclose(fpin);
+
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/write/disk%d", n->tracediskGB, diskid);
+        while (currErrorRate < targetErrorRate) {
+            fpin = fopen(buf, "r");
+            while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
+                rq.slba = offset / ssd->sp.secsz;
+                rq.nlb = len / ssd->sp.secsz;
+
+                ssd_write(ssd, &rq);
+                if (should_gc(ssd)) {
+                    do_gc(ssd, false);
+                }
+
+                if (currErrorRate >= targetErrorRate) {
+                    break;
+                }
+            }
+            fclose(fpin);
+        }
+
+        fflush(outfp);
+        fclose(outfp);
+        ResetState(ssd);
     }
+    fclose(fp);
+    abort();
+
+    // int prefillmb = n->tracediskGB * 1024 * 6 / 10;
+    // for (int mb = 0;mb < prefillmb;mb += 1) {
+    //     offset = (uint64_t)mb * 1024 * 1024;
+    //     len = 1024 * 1024;
+    //     rq.slba = offset / ssd->sp.secsz;
+    //     rq.nlb = len / ssd->sp.secsz;
+
+    //     ssd_write(ssd, &rq);
+    //     if (should_gc(ssd)) {
+    //         do_gc(ssd, false);
+    //     }
+    // }
+    // printf("\nprefill %d MB\n", prefillmb);
 
     return NULL;
 }
