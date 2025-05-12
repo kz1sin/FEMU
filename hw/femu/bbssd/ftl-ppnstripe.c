@@ -1184,7 +1184,7 @@ static void* trace(void* arg) {
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
         if (n->rain_stripe_size > 1) {
-            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/disk%dprefillPPNBaseline%d+1", n->tracediskGB, diskid, n->rain_stripe_size - 1);
+            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/output/disk%dprefillPPNBaseline%d+1", n->tracediskGB, diskid, n->rain_stripe_size - 1);
         } else {
             sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/disk%dprefillECC", n->tracediskGB, diskid);
         }
@@ -1228,21 +1228,57 @@ static void* trace(void* arg) {
         ResetState(ssd);
     }
     fclose(fp);
-    abort();
 
-    // int prefillmb = n->tracediskGB * 1024 * 6 / 10;
-    // for (int mb = 0;mb < prefillmb;mb += 1) {
-    //     offset = (uint64_t)mb * 1024 * 1024;
-    //     len = 1024 * 1024;
-    //     rq.slba = offset / ssd->sp.secsz;
-    //     rq.nlb = len / ssd->sp.secsz;
 
-    //     ssd_write(ssd, &rq);
-    //     if (should_gc(ssd)) {
-    //         do_gc(ssd, false);
+    // char buf[256];
+    // sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB8cycle%d+1/diskids%d", n->rain_stripe_size - 1, n->tracefile);
+    // printf("tracefile %s\n", buf);
+
+    // int full = 0;
+    // FILE* fp = fopen(buf, "r");
+    // while (fscanf(fp, "%d", &full) != EOF) {
+    //     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB8cycle%d+1/PPNBaselinefull%d", n->rain_stripe_size - 1, full);
+    //     outfp = fopen(buf, "w");
+    //     printf("outfile %s\n", buf);
+
+    //     int prefillmb = 20 * 1024 * full / 100;
+    //     for (int mb = 0;mb < prefillmb;mb += 1) {
+    //         offset = (uint64_t)mb * 1024 * 1024;
+    //         len = 1024 * 1024;
+    //         rq.slba = offset / ssd->sp.secsz;
+    //         rq.nlb = len / ssd->sp.secsz;
+
+    //         ssd_write(ssd, &rq);
+    //         if (should_gc(ssd)) {
+    //             do_gc(ssd, false);
+    //         }
     //     }
+    //     printf("\nprefill %d MB\n", prefillmb);
+
+    //     while (currErrorRate < targetErrorRate) {
+    //         FILE* fpin = fopen("/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB8cycletrace", "r");
+    //         while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
+    //             rq.slba = offset / ssd->sp.secsz;
+    //             rq.nlb = len / ssd->sp.secsz;
+
+    //             ssd_write(ssd, &rq);
+    //             if (should_gc(ssd)) {
+    //                 do_gc(ssd, false);
+    //             }
+
+    //             if (currErrorRate >= targetErrorRate) {
+    //                 break;
+    //             }
+    //         }
+    //         fclose(fpin);
+    //     }
+    //     fflush(outfp);
+    //     fclose(outfp);
+    //     ResetState(ssd);
     // }
-    // printf("\nprefill %d MB\n", prefillmb);
+    // fclose(fp);
+
+    abort();
 
     return NULL;
 }

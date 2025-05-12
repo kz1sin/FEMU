@@ -15,9 +15,12 @@ static double currErrorRate = 0;
 static const double targetErrorRate = 1e-5;
 static FILE* outfp;
 
+uint64_t freeorder = 0;
+
 typedef struct LIF {
     struct line* ln;
     double lineUPER;
+    uint64_t order;
     size_t writtenMinPos, freeMinPos, freeMaxPos; // for priority queue
 } LineInfo;
 
@@ -252,7 +255,19 @@ static inline pqueue_pri_t UPERGetPri(void* a) {
 }
 
 static inline void UPERSetPri(void* a, pqueue_pri_t pri) {
+    ((LineInfo*)a)->order = pri;
+}
+
+static inline pqueue_pri_t OrderGetPri(void* a) {
+    return ((LineInfo*)a)->order;
+}
+
+static inline void OrderSetPri(void* a, pqueue_pri_t pri) {
     ((LineInfo*)a)->lineUPER = *((double*)(&pri));
+}
+
+static inline int OrderCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
+    return (next > curr);
 }
 
 static inline int MinCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
@@ -337,7 +352,10 @@ static void ssd_init_lines(struct ssd* ssd)
         }
 
         writtenMinPQ = pqueue_init(spp->tt_lines, MinCmpPri, UPERGetPri, UPERSetPri, WrittenMinGetPos, WrittenMinSetPos);
-        freeMinPQ = pqueue_init(spp->tt_lines, MinCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
+
+        // freeMinPQ = pqueue_init(spp->tt_lines, MinCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
+        freeMinPQ = pqueue_init(spp->tt_lines, OrderCmpPri, OrderGetPri, OrderSetPri, FreeMinGetPos, FreeMinSetPos);
+
         freeMaxPQ = pqueue_init(spp->tt_lines, MaxCmpPri, UPERGetPri, UPERSetPri, FreeMaxGetPos, FreeMaxSetPos);
         lineinfo = g_malloc0(sizeof(LineInfo) * spp->tt_lines);
         for (int i = 0;i < spp->tt_lines;i += 1) {
@@ -346,6 +364,9 @@ static void ssd_init_lines(struct ssd* ssd)
             lineinfo[i].freeMaxPos = 0;
             lineinfo[i].freeMinPos = 0;
             lineinfo[i].writtenMinPos = 0;
+
+            lineinfo[i].order = 0;
+
             pqueue_insert(freeMinPQ, &lineinfo[i]);
             pqueue_insert(freeMaxPQ, &lineinfo[i]);
         }
@@ -1339,18 +1360,21 @@ static void mark_line_free(struct ssd* ssd, struct ppa* ppa, bool channel)
         if (!maxfree) {
             ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
         }
-        if (curr->lineUPER > maxfree->lineUPER) {
-            pqueue_pop(freeMaxPQ);
-            pqueue_remove(freeMinPQ, maxfree);
-            if (!channel) {
-                SwapFreeStripe(ssd, maxfree, curr);
-            } else {
-                ChannelSwapFreeStripe(ssd, maxfree, curr);
-            }
-            swapFreeCount += 1;
-            pqueue_insert(freeMinPQ, maxfree);
-            pqueue_insert(freeMaxPQ, maxfree);
-        }
+        // if (curr->lineUPER > maxfree->lineUPER) {
+        //     pqueue_pop(freeMaxPQ);
+        //     pqueue_remove(freeMinPQ, maxfree);
+        //     if (!channel) {
+        //         SwapFreeStripe(ssd, maxfree, curr);
+        //     } else {
+        //         ChannelSwapFreeStripe(ssd, maxfree, curr);
+        //     }
+        //     swapFreeCount += 1;
+        //     pqueue_insert(freeMinPQ, maxfree);
+        //     pqueue_insert(freeMaxPQ, maxfree);
+        // }
+
+        freeorder += 1;
+        curr->order = freeorder;
 
         pqueue_insert(freeMinPQ, curr);
         pqueue_insert(freeMaxPQ, curr);
@@ -1364,17 +1388,21 @@ static void mark_line_free(struct ssd* ssd, struct ppa* ppa, bool channel)
             ClearFullStripe(ssd, minwritten, maxfree);
             clearFullCount += 1;
 
-            maxfree = pqueue_pop(freeMaxPQ);
-            pqueue_remove(freeMinPQ, maxfree);
-            // if (false) {
-            if (!channel) {
-                SwapFreeStripe(ssd, minwritten, maxfree);
-            } else {
-                ChannelSwapFreeStripe(ssd, minwritten, maxfree);
+            // maxfree = pqueue_pop(freeMaxPQ);
+            // pqueue_remove(freeMinPQ, maxfree);
+            if (false) {
+                if (!channel) {
+                    SwapFreeStripe(ssd, minwritten, maxfree);
+                } else {
+                    ChannelSwapFreeStripe(ssd, minwritten, maxfree);
+                }
             }
-            // }
-            pqueue_insert(freeMinPQ, maxfree);
-            pqueue_insert(freeMaxPQ, maxfree);
+            // pqueue_insert(freeMinPQ, maxfree);
+            // pqueue_insert(freeMaxPQ, maxfree);
+
+            freeorder += 1;
+            minwritten->order = freeorder;
+
             pqueue_insert(freeMinPQ, minwritten);
             pqueue_insert(freeMaxPQ, minwritten);
         }
@@ -1640,6 +1668,9 @@ static void ResetState(struct ssd* ssd) {
             lineinfo[i].freeMaxPos = 0;
             lineinfo[i].freeMinPos = 0;
             lineinfo[i].writtenMinPos = 0;
+
+            lineinfo[i].order = 0;
+
             pqueue_insert(freeMinPQ, &lineinfo[i]);
             pqueue_insert(freeMaxPQ, &lineinfo[i]);
         }
@@ -1652,6 +1683,8 @@ static void ResetState(struct ssd* ssd) {
     hostPageWrites = ssdPageWrites = GCPageWrites = parityPageWrites = 0;
     currStripeOffset = parityReverseOffset = 0;
     currErrorRate = 0;
+
+    freeorder = 0;
 }
 
 static QemuThread trace_thread;
@@ -1671,7 +1704,7 @@ static void* trace(void* arg) {
     int diskid = 0;
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/output/disk%dprefillGreedy%d+1", n->tracediskGB, diskid, n->rain_stripe_size - 1);
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/output/disk%dprefillWL%d+1", n->tracediskGB, diskid, n->rain_stripe_size - 1);
         outfp = fopen(buf, "w");
         printf("outfile %s\n", buf);
 
@@ -1721,7 +1754,7 @@ static void* trace(void* arg) {
     // int full = 0;
     // FILE* fp = fopen(buf, "r");
     // while (fscanf(fp, "%d", &full) != EOF) {
-    //     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB8cycle%d+1/Greedyfull%d", n->rain_stripe_size - 1, full);
+    //     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB8cycle%d+1/WLfull%d", n->rain_stripe_size - 1, full);
     //     outfp = fopen(buf, "w");
     //     printf("outfile %s\n", buf);
 
