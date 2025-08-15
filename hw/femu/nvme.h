@@ -1162,6 +1162,7 @@ typedef struct BbCtrlParams {
     int ch_xfer_lat;
 
     int gc_thres_pcent;
+    int gc_thres_pcent_rain;
     int gc_thres_pcent_high;
 } BbCtrlParams;
 
@@ -1339,7 +1340,8 @@ typedef struct FemuCtrl {
 
     BbCtrlParams bb_params;
 
-    int             rain_stripe_size;
+    int rain_stripe_size;
+    int pwl, superl;
     int tracefile;
     int tracediskGB;
     struct ssd* ssd;

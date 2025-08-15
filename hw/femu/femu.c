@@ -675,6 +675,8 @@ static Property femu_props[] = {
     DEFINE_PROP_INT32("zns_flash_type", FemuCtrl, zns_params.zns_flash_type, QLC),
     DEFINE_PROP_INT32("tracefile", FemuCtrl, tracefile, 0),
     DEFINE_PROP_INT32("tracediskGB", FemuCtrl, tracediskGB, 0),
+    DEFINE_PROP_INT32("pwl", FemuCtrl, pwl, 0),
+    DEFINE_PROP_INT32("superl", FemuCtrl, superl, 0),
     DEFINE_PROP_INT32("rain_stripe_size", FemuCtrl, rain_stripe_size, 1),
     DEFINE_PROP_INT32("secsz", FemuCtrl, bb_params.secsz, 512),
     DEFINE_PROP_INT32("secs_per_pg", FemuCtrl, bb_params.secs_per_pg, 8),
@@ -688,6 +690,7 @@ static Property femu_props[] = {
     DEFINE_PROP_INT32("blk_er_lat", FemuCtrl, bb_params.blk_er_lat, 2000000),
     DEFINE_PROP_INT32("ch_xfer_lat", FemuCtrl, bb_params.ch_xfer_lat, 0),
     DEFINE_PROP_INT32("gc_thres_pcent", FemuCtrl, bb_params.gc_thres_pcent, 75),
+    DEFINE_PROP_INT32("gc_thres_pcent_rain", FemuCtrl, bb_params.gc_thres_pcent_rain, 95),
     DEFINE_PROP_INT32("gc_thres_pcent_high", FemuCtrl, bb_params.gc_thres_pcent_high, 95),
     DEFINE_PROP_END_OF_LIST(),
 };

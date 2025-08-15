@@ -108,6 +108,8 @@ struct ssd_channel {
 };
 
 struct ssdparams {
+    int pwl; // init threshold percentage
+    int superl; // if positive, do stripe UPER leveling after reforge
     int rain_stripe_size;
     int pagesize; // in bytes
     uint64_t parity_start_lpn;
@@ -129,6 +131,8 @@ struct ssdparams {
 
     double gc_thres_pcent;
     int gc_thres_lines;
+    double gc_thres_pcent_rain;
+    int gc_thres_lines_rain;
     double gc_thres_pcent_high;
     int gc_thres_lines_high;
     bool enable_gc_delay;

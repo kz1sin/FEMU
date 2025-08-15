@@ -1,5 +1,4 @@
 #include <math.h>
-#include <stdlib.h>
 #include "ftl.h"
 
 //#define FEMU_DEBUG_FTL
@@ -14,28 +13,17 @@ typedef struct StripeInfo {
     int stripeindex, vpc, ipc;
     double upersum;
     QTAILQ_ENTRY(StripeInfo) entry;
-    size_t victimPos, writtenMinPos, freeMinPos, freeMaxPos; // for priority queue
+    size_t victimPos, writtenMinPos;
 } StripeInfo;
-
-typedef struct LINESTATUS {
-    int lineid, erasecount;
-    bool isfree, isparity;
-} LineStatus;
-
-typedef struct UPERINDEX {
-    double uper;
-    int lineid;
-    bool chosen;
-} UPERIndex;
 
 // should reset
 static uint64_t hostPageWrites = 0, ssdPageWrites = 0, GCPageWrites = 0, parityPageWrites = 0, PWLPageWrites = 0;
-static int gcCount = 0, currStripeOffset = 0, swapFreeCount = 0, clearFullCount = 0, reforge = 0; // reforge 0: before, 1: reforging, 2: finished, prevent starting reforge again when gc in reforge
-static double currErrorRate = 0, UPERsum = 0;
+static int gcCount = 0, currStripeOffset = 0;
+static double currErrorRate = 0;
 static FILE* outfp;
 static LineInfo* lineinfo;
 static StripeInfo* stripeinfo;
-pqueue_t* writtenMinECPQ, * victimStripePQ, * freeMinUPERPQ, * freeMaxUPERPQ, * writtenMinUPERPQ; // priority queue for PWL and SUPERL
+pqueue_t* writtenMinPQ, * victimStripePQ; // priority queue for PWL
 QTAILQ_HEAD(freeStripeList, StripeInfo) freeStripeList;
 QTAILQ_HEAD(fullStripeList, StripeInfo) fullStripeList;
 static int* stripe2line = NULL, * line2stripe = NULL; // mapping between line id and stripe, remains the same in this baseline case
@@ -46,23 +34,12 @@ static const uint64_t PARITYLPN = INVALID_LPN - 1;
 int logicalPages = 0, RAINlogicalPages = 0, totalStripes = 0, RAINCycleLimit = 0;
 static double targetErrorRate = 0;
 
-// buffer for reforge and SUPERL
-static UPERIndex* UPERBuffer;
-static LineStatus* LineECBuffer;
-
 // RBER model parameters
 static const double K = 2.05;
 static const double ALPHA = 3.9e-10;
 static const double EPSILON = 1.48e-3;
 static const int ECC = 128;
 static const int CYCLELIMIT = 900;
-
-static void reforgeSSD(struct ssd* ssd);
-
-// for sorting lines according to erase count
-static inline int CmpEC(const void* a, const void* b) {
-    return ((LineStatus*)a)->erasecount - ((LineStatus*)b)->erasecount;
-}
 
 static inline double RBER(int cycle) {
     return EPSILON + ALPHA * pow(cycle, K);
@@ -95,57 +72,37 @@ static double DevicePFail(struct ssd* ssd) {
     struct ssdparams* spp = &ssd->sp;
     double p = 0, maxupersum = 0, minupersum = 0;
     int maxupersumstripe = 0, minupersumstripe = 0;
-    int lpages = logicalPages;
-    if (reforge == 2) {
-        lpages = RAINlogicalPages;
-        // parity stripes UPER
-        for (int s = 0; s < totalStripes; s++) {
-            int stripeindex = s * spp->rain_stripe_size;
-            double minus = 0, sum = 0;
-            for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-                int ln = stripe2line[stripeindex + o];
-                sum += lineuper[ln];
-                minus += lineuper[ln] * lineuper[ln];
-            }
-            assert(sum == stripeinfo[s].upersum);
-            double stripeuper = (sum * sum - minus) / 2.0;
-            if (s == 0 || sum > maxupersum) {
-                maxupersum = sum;
-                maxupersumstripe = s;
-            }
-            if (s == 0 || sum < minupersum) {
-                minupersum = sum;
-                minupersumstripe = s;
-            }
-            p += stripeuper;
+    for (int s = 0; s < totalStripes; s++) {
+        int stripeindex = s * spp->rain_stripe_size;
+        double minus = 0, sum = 0;
+        for (int o = 0;o < spp->rain_stripe_size;o += 1) {
+            int ln = stripe2line[stripeindex + o];
+            sum += lineuper[ln];
+            minus += lineuper[ln] * lineuper[ln];
         }
-    } else {
-        // ECC lines UPER
-        for (int s = 0; s < spp->tt_lines; s++) {
-            double stripeuper = stripeinfo[s].upersum;
-            assert(stripeuper == UPER(lineinfo[s].erasecount));
-            if (s == 0 || stripeuper > maxupersum) {
-                maxupersum = stripeuper;
-                maxupersumstripe = s;
-            }
-            if (s == 0 || stripeuper < minupersum) {
-                minupersum = stripeuper;
-                minupersumstripe = s;
-            }
-            p += stripeuper;
+        assert(sum == stripeinfo[s].upersum);
+        double stripeuper = (sum * sum - minus) / 2.0;
+        if (s == 0 || sum > maxupersum) {
+            maxupersum = sum;
+            maxupersumstripe = s;
         }
+        if (s == 0 || sum < minupersum) {
+            minupersum = sum;
+            minupersumstripe = s;
+        }
+        p += stripeuper;
     }
     fprintf(outfp, "maxupersum %d %e minupersum %d %e\n", maxupersumstripe, maxupersum, minupersumstripe, minupersum);
-    return p / spp->tt_lines * lpages; // scale to logical size
+    return p / spp->tt_lines * RAINlogicalPages; // scale to logical size
 }
 
 void dumpBlocks(struct ssd* ssd) {
     struct ssdparams* spp = &ssd->sp;
     currErrorRate = DevicePFail(ssd);
     fprintf(outfp, "devicep %e targetp %e\n", currErrorRate, targetErrorRate);
-    if (reforge != 1 && currErrorRate >= targetErrorRate) {
-        // lines grouped by stripes
+    if (currErrorRate >= targetErrorRate) {
         fprintf(outfp, "\nlineerasecount\n");
+        // lines grouped by stripes
         for (int lnindex = 0; lnindex < spp->tt_lines; lnindex++) {
             int ln = stripe2line[lnindex];
             int cnt = lineinfo[ln].erasecount;
@@ -168,11 +125,6 @@ void dumpBlocks(struct ssd* ssd) {
         //     }
         // }
         // fprintf(outfp, "\nfreecount %d\n", freecount);
-
-        // construct parity stripes if not reforged
-        if (reforge == 0) {
-            reforgeSSD(ssd);
-        }
     }
 }
 
@@ -180,10 +132,7 @@ static void* ftl_thread(void* arg);
 
 static inline bool should_gc(struct ssd* ssd)
 {
-    if (reforge == 2) {
-        return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines_rain);
-    }
-    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines);
+    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines_rain);
 }
 
 static inline bool should_gc_high(struct ssd* ssd)
@@ -268,26 +217,8 @@ static inline void ECSetPri(void* a, pqueue_pri_t pri) {
     lineinfo[lid].erasecount = pri;
 }
 
-static inline int MinECCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
+static inline int MinCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
     return (next > curr);
-}
-
-static inline pqueue_pri_t UPERGetPri(void* a) {
-    return *((pqueue_pri_t*)(&((StripeInfo*)a)->upersum));
-}
-
-static inline void UPERSetPri(void* a, pqueue_pri_t pri) {
-    ((StripeInfo*)a)->upersum = *((double*)(&pri));
-}
-
-static inline int MinUPERCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
-    double n = *((double*)(&next)), c = *((double*)(&curr));
-    return (n > c);
-}
-
-static inline int MaxUPERCmpPri(pqueue_pri_t next, pqueue_pri_t curr) {
-    double n = *((double*)(&next)), c = *((double*)(&curr));
-    return (n < c);
 }
 
 static inline size_t WrittenMinGetPos(void* a) {
@@ -296,22 +227,6 @@ static inline size_t WrittenMinGetPos(void* a) {
 
 static inline void WrittenMinSetPos(void* a, size_t pos) {
     ((StripeInfo*)a)->writtenMinPos = pos;
-}
-
-static inline size_t FreeMinGetPos(void* a) {
-    return ((StripeInfo*)a)->freeMinPos;
-}
-
-static inline void FreeMinSetPos(void* a, size_t pos) {
-    ((StripeInfo*)a)->freeMinPos = pos;
-}
-
-static inline size_t FreeMaxGetPos(void* a) {
-    return ((StripeInfo*)a)->freeMaxPos;
-}
-
-static inline void FreeMaxSetPos(void* a, size_t pos) {
-    ((StripeInfo*)a)->freeMaxPos = pos;
 }
 
 static void ssd_init_lines(struct ssd* ssd)
@@ -337,10 +252,7 @@ static void ssd_init_lines(struct ssd* ssd)
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
 
-    writtenMinECPQ = pqueue_init(spp->tt_lines, MinECCmpPri, ECGetPri, ECSetPri, WrittenMinGetPos, WrittenMinSetPos);
-    freeMinUPERPQ = pqueue_init(totalStripes, MinUPERCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
-    freeMaxUPERPQ = pqueue_init(totalStripes, MaxUPERCmpPri, UPERGetPri, UPERSetPri, FreeMaxGetPos, FreeMaxSetPos);
-    writtenMinUPERPQ = pqueue_init(totalStripes, MinUPERCmpPri, UPERGetPri, UPERSetPri, WrittenMinGetPos, WrittenMinSetPos);
+    writtenMinPQ = pqueue_init(totalStripes, MinCmpPri, ECGetPri, ECSetPri, WrittenMinGetPos, WrittenMinSetPos);
     lineinfo = g_malloc0(sizeof(LineInfo) * spp->tt_lines);
     for (int i = 0;i < spp->tt_lines;i += 1) {
         lineinfo[i].ln = &lm->lines[i];
@@ -348,22 +260,20 @@ static void ssd_init_lines(struct ssd* ssd)
         lineinfo[i].writtenMinPos = 0;
     }
 
-    // initial stripe is same as line
     QTAILQ_INIT(&freeStripeList);
-    victimStripePQ = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
+    victimStripePQ = pqueue_init(totalStripes, victim_line_cmp_pri,
         victim_line_get_pri, victim_line_set_pri,
         victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&fullStripeList);
     double init = UPER(0);
-    stripeinfo = g_malloc0(sizeof(StripeInfo) * spp->tt_lines);
-    for (int i = 0;i < spp->tt_lines;i += 1) {
+    stripeinfo = g_malloc0(sizeof(StripeInfo) * totalStripes);
+    for (int i = 0;i < totalStripes;i += 1) {
         stripeinfo[i].ipc = stripeinfo[i].vpc = 0;
-        stripeinfo[i].stripeindex = i;
-        stripeinfo[i].upersum = init;
-        stripeinfo[i].victimPos = stripeinfo[i].writtenMinPos = stripeinfo[i].freeMaxPos = stripeinfo[i].freeMinPos = 0;
+        stripeinfo[i].stripeindex = i * spp->rain_stripe_size;
+        stripeinfo[i].upersum = init * spp->rain_stripe_size;
+        stripeinfo[i].victimPos = stripeinfo[i].writtenMinPos = 0;
         QTAILQ_INSERT_TAIL(&freeStripeList, &stripeinfo[i], entry);
     }
-    UPERsum = init * spp->tt_lines;
 
     line2stripe = g_malloc0(sizeof(int) * spp->tt_lines);
     stripe2line = g_malloc0(sizeof(int) * spp->tt_lines);
@@ -372,9 +282,6 @@ static void ssd_init_lines(struct ssd* ssd)
         line2stripe[i] = stripe2line[i] = i;
         lineuper[i] = init;
     }
-
-    UPERBuffer = g_malloc0(sizeof(UPERIndex) * spp->rain_stripe_size * 2);
-    LineECBuffer = g_malloc0(sizeof(LineStatus) * spp->tt_lines);
 }
 
 static void ssd_init_write_pointer(struct ssd* ssd)
@@ -385,7 +292,7 @@ static void ssd_init_write_pointer(struct ssd* ssd)
 
     StripeInfo* st = QTAILQ_FIRST(&freeStripeList);
     QTAILQ_REMOVE(&freeStripeList, st, entry);
-    lm->free_line_cnt -= 1;
+    lm->free_line_cnt -= ssd->sp.rain_stripe_size;
     // get line from mapping
     int lid = stripe2line[st->stripeindex];
     curline = &lm->lines[lid];
@@ -450,33 +357,16 @@ static uint64_t new_parity_write_page(struct ssd* ssd, struct ppa* new_ppa, uint
 
 static struct line* get_next_free_line(struct ssd* ssd)
 {
-    struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* curline = NULL;
 
-    StripeInfo* st;
-    int linecnt = 1;
-    if (reforge == 2) {
-        linecnt = spp->rain_stripe_size;
+    StripeInfo* st = QTAILQ_FIRST(&freeStripeList);
+    if (!st) {
+        ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+        return NULL;
     }
-    if (reforge == 2 && spp->superl > 0) {
-        st = pqueue_peek(freeMinUPERPQ);
-        if (!st) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
-            return NULL;
-        }
-        pqueue_pop(freeMinUPERPQ);
-        pqueue_remove(freeMaxUPERPQ, st);
-    } else {
-        st = QTAILQ_FIRST(&freeStripeList);
-        if (!st) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
-            return NULL;
-        }
-        QTAILQ_REMOVE(&freeStripeList, st, entry);
-    }
-    lm->free_line_cnt -= linecnt;
-
+    QTAILQ_REMOVE(&freeStripeList, st, entry);
+    lm->free_line_cnt -= ssd->sp.rain_stripe_size;
     // get line from mapping
     int lid = stripe2line[st->stripeindex];
     curline = &lm->lines[lid];
@@ -491,82 +381,66 @@ static void ssd_advance_write_pointer(struct ssd* ssd)
 
     ssdPageWrites += 1;
 
-    if (reforge == 2) {
-        currStripeOffset += 1;
-        // write order of striping across lines
-        int lid = wpp->curline->id;
-        int newlid = stripe2line[line2stripe[lid] + 1];
+    currStripeOffset += 1;
+    // write order of striping across lines
+    int lid = wpp->curline->id;
+    int newlid = stripe2line[line2stripe[lid] + 1];
+    wpp->curline = &lm->lines[newlid];
+    wpp->blk = wpp->curline->id;
+    if (currStripeOffset >= spp->rain_stripe_size - 1) {
+        // write parity at the end of stripe
+        struct ppa ppage = get_new_page(ssd);
+        new_parity_write_page(ssd, &ppage, PARITYLPN);
+        ssdPageWrites += 1;
+        // reset stripe offset
+        currStripeOffset = 0;
+        int stripeindex = line2stripe[wpp->curline->id];
+        assert(stripeindex % spp->rain_stripe_size == spp->rain_stripe_size - 1);
+        newlid = stripe2line[stripeindex + 1 - spp->rain_stripe_size];
         wpp->curline = &lm->lines[newlid];
         wpp->blk = wpp->curline->id;
-        if (currStripeOffset >= spp->rain_stripe_size - 1) {
-            // write parity at the end of stripe
-            struct ppa ppage = get_new_page(ssd);
-            new_parity_write_page(ssd, &ppage, PARITYLPN);
-            ssdPageWrites += 1;
-            // reset stripe offset
-            currStripeOffset = 0;
-            int stripeindex = line2stripe[wpp->curline->id];
-            assert(stripeindex % spp->rain_stripe_size == spp->rain_stripe_size - 1);
-            newlid = stripe2line[stripeindex + 1 - spp->rain_stripe_size];
-            wpp->curline = &lm->lines[newlid];
-            wpp->blk = wpp->curline->id;
-        } else {
-            return;
-        }
-    }
-
-    // advance to next stripe if reforged, next page if not
-    check_addr(wpp->ch, spp->nchs);
-    wpp->ch++;
-    if (wpp->ch == spp->nchs) {
-        wpp->ch = 0;
-        check_addr(wpp->lun, spp->luns_per_ch);
-        wpp->lun++;
-        /* in this case, we should go to next lun */
-        if (wpp->lun == spp->luns_per_ch) {
-            wpp->lun = 0;
-            /* go to next page in the block */
-            check_addr(wpp->pg, spp->pgs_per_blk);
-            wpp->pg++;
-            if (wpp->pg == spp->pgs_per_blk) {
-                wpp->pg = 0;
-                /* move current line to {victim,full} line list */
-                int sid = line2stripe[wpp->curline->id];
-                StripeInfo* stripe;
-                int linecnt = 1;
-                if (reforge == 2) {
-                    sid /= spp->rain_stripe_size;
-                    stripe = &stripeinfo[sid];
-                    linecnt = spp->rain_stripe_size;
-                    pqueue_insert(writtenMinUPERPQ, stripe);
-                } else {
-                    stripe = &stripeinfo[sid];
-                    pqueue_insert(writtenMinECPQ, stripe);
+        check_addr(wpp->ch, spp->nchs);
+        wpp->ch++;
+        if (wpp->ch == spp->nchs) {
+            wpp->ch = 0;
+            check_addr(wpp->lun, spp->luns_per_ch);
+            wpp->lun++;
+            /* in this case, we should go to next lun */
+            if (wpp->lun == spp->luns_per_ch) {
+                wpp->lun = 0;
+                /* go to next page in the block */
+                check_addr(wpp->pg, spp->pgs_per_blk);
+                wpp->pg++;
+                if (wpp->pg == spp->pgs_per_blk) {
+                    wpp->pg = 0;
+                    /* move current line to {victim,full} line list */
+                    int sid = line2stripe[wpp->curline->id] / spp->rain_stripe_size;
+                    StripeInfo* stripe = &stripeinfo[sid];
+                    if (stripe->vpc == spp->pgs_per_line * spp->rain_stripe_size) {
+                        QTAILQ_INSERT_TAIL(&fullStripeList, stripe, entry);
+                        lm->full_line_cnt += spp->rain_stripe_size;
+                    } else {
+                        pqueue_insert(victimStripePQ, stripe);
+                        lm->victim_line_cnt += spp->rain_stripe_size;
+                    }
+                    pqueue_insert(writtenMinPQ, stripe);
+                    /* current line is used up, pick another empty line */
+                    check_addr(wpp->blk, spp->blks_per_pl);
+                    wpp->curline = NULL;
+                    wpp->curline = get_next_free_line(ssd);
+                    if (!wpp->curline) {
+                        /* TODO */
+                        abort();
+                    }
+                    wpp->blk = wpp->curline->id;
+                    check_addr(wpp->blk, spp->blks_per_pl);
+                    /* make sure we are starting from page 0 in the super block */
+                    ftl_assert(wpp->pg == 0);
+                    ftl_assert(wpp->lun == 0);
+                    ftl_assert(wpp->ch == 0);
+                    /* TODO: assume # of pl_per_lun is 1, fix later */
+                    ftl_assert(wpp->pl == 0);
                 }
-                if (stripe->vpc == spp->pgs_per_line * linecnt) {
-                    QTAILQ_INSERT_TAIL(&fullStripeList, stripe, entry);
-                    lm->full_line_cnt += linecnt;
-                } else {
-                    pqueue_insert(victimStripePQ, stripe);
-                    lm->victim_line_cnt += linecnt;
-                }
-
-                /* current line is used up, pick another empty line */
-                check_addr(wpp->blk, spp->blks_per_pl);
-                wpp->curline = NULL;
-                wpp->curline = get_next_free_line(ssd);
-                if (!wpp->curline) {
-                    /* TODO */
-                    abort();
-                }
-                wpp->blk = wpp->curline->id;
-                check_addr(wpp->blk, spp->blks_per_pl);
-                /* make sure we are starting from page 0 in the super block */
-                ftl_assert(wpp->pg == 0);
-                ftl_assert(wpp->lun == 0);
-                ftl_assert(wpp->ch == 0);
-                /* TODO: assume # of pl_per_lun is 1, fix later */
-                ftl_assert(wpp->pl == 0);
             }
         }
     }
@@ -637,7 +511,6 @@ static void ssd_init_params(struct ssdparams* spp, FemuCtrl* n)
     spp->rain_stripe_size = n->rain_stripe_size;
     assert(spp->rain_stripe_size > 1);
     spp->pwl = n->pwl;
-    spp->superl = n->superl;
     spp->pagesize = n->bb_params.secsz * n->bb_params.secs_per_pg;
     spp->parity_start_lpn = (uint64_t)n->memsz * 1024 * 1024 / spp->pagesize;
     logicalPages = spp->parity_start_lpn;
@@ -920,18 +793,13 @@ static void mark_page_invalid(struct ssd* ssd, struct ppa* ppa)
     /* update corresponding line status */
     line = get_line(ssd, ppa);
     bool was_full_line = false;
-    int sid = line2stripe[line->id];
-    int linecnt = 1;
-    if (reforge == 2) {
-        sid /= spp->rain_stripe_size;
-        linecnt = spp->rain_stripe_size;
-    }
+    int sid = line2stripe[line->id] / spp->rain_stripe_size;
     StripeInfo* stripe = &stripeinfo[sid];
-    if (stripe->vpc == spp->pgs_per_line * linecnt) {
+    stripe->ipc += 1;
+    if (stripe->vpc == spp->pgs_per_line * spp->rain_stripe_size) {
         assert(stripe->victimPos == 0);
         was_full_line = true;
     }
-    stripe->ipc += 1;
 
     if (stripe->victimPos) {
         /* Note that vpc will be updated by this call */
@@ -942,9 +810,9 @@ static void mark_page_invalid(struct ssd* ssd, struct ppa* ppa)
 
     if (was_full_line) {
         QTAILQ_REMOVE(&fullStripeList, stripe, entry);
-        lm->full_line_cnt -= linecnt;
+        lm->full_line_cnt -= spp->rain_stripe_size;
         pqueue_insert(victimStripePQ, stripe);
-        lm->victim_line_cnt += linecnt;
+        lm->victim_line_cnt += spp->rain_stripe_size;
     }
 }
 
@@ -966,13 +834,7 @@ static void mark_page_valid(struct ssd* ssd, struct ppa* ppa)
 
     /* update corresponding line status */
     line = get_line(ssd, ppa);
-    int sid = line2stripe[line->id];
-    if (reforge == 2) {
-        sid /= ssd->sp.rain_stripe_size;
-    } else if (reforge == 1) {
-        // when write parity in reforge, line2stripe already changed
-        sid = line->id;
-    }
+    int sid = line2stripe[line->id] / ssd->sp.rain_stripe_size;
     StripeInfo* stripe = &stripeinfo[sid];
     stripe->vpc += 1;
 }
@@ -1059,24 +921,15 @@ static StripeInfo* select_victim_stripe(struct ssd* ssd, bool force)
         return NULL;
     }
 
-    int linecnt = 1;
-    if (reforge == 2) {
-        linecnt = spp->rain_stripe_size;
-    }
-
-    if (!force && stripe->ipc < spp->pgs_per_line * linecnt / 8) {
+    if (!force && stripe->ipc < spp->pgs_per_line * spp->rain_stripe_size / 8) {
         return NULL;
     }
 
     pqueue_pop(victimStripePQ);
     stripe->victimPos = 0;
-    lm->victim_line_cnt -= linecnt;
+    lm->victim_line_cnt -= spp->rain_stripe_size;
 
-    if (reforge == 2) {
-        pqueue_remove(writtenMinUPERPQ, stripe);
-    } else {
-        pqueue_remove(writtenMinECPQ, stripe);
-    }
+    pqueue_remove(writtenMinPQ, stripe);
     stripe->writtenMinPos = 0;
 
     /* victim_line is a danggling node now */
@@ -1106,125 +959,30 @@ static void clean_one_block(struct ssd* ssd, struct ppa* ppa)
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
 }
 
-static void InsSort(UPERIndex* arr, int size) {
-    int i, j;
-    UPERIndex tmp;
-    for (i = 1; i < size; i++) {
-        if (arr[i].uper < arr[i - 1].uper) {
-            tmp = arr[i];
-            for (j = i - 1; j >= 0 && arr[j].uper > tmp.uper; j--) {
-                arr[j + 1] = arr[j];
-            }
-            arr[j + 1] = tmp;
-        }
-    }
-}
-
-static void SwapFreeStripe(struct ssd* ssd, StripeInfo* a, StripeInfo* b) {
+static void MoveColdData(struct ssd* ssd, StripeInfo* cold, StripeInfo* free) {
     struct ssdparams* spp = &ssd->sp;
-    double sum = a->upersum + b->upersum;
-    double target = sum / 2;
-    // copy uper of lines in both stripes to buffer
-    for (int i = 0;i < spp->rain_stripe_size;i += 1) {
-        int lid = stripe2line[a->stripeindex + i];
-        UPERBuffer[i].lineid = lid;
-        UPERBuffer[i].uper = lineuper[lid];
-        UPERBuffer[i].chosen = false;
-    }
-    for (int i = 0;i < spp->rain_stripe_size;i += 1) {
-        int lid = stripe2line[b->stripeindex + i];
-        UPERBuffer[i + spp->rain_stripe_size].lineid = lid;
-        UPERBuffer[i + spp->rain_stripe_size].uper = lineuper[lid];
-        UPERBuffer[i + spp->rain_stripe_size].chosen = false;
-    }
-    InsSort(UPERBuffer, spp->rain_stripe_size * 2);
-
-    int head = 0, tail = spp->rain_stripe_size * 2 - 1;
-    double stripesum = 0;
-    int j = 0;
-    // select uper in descending order until max but not exceeding target
-    for (;j < spp->rain_stripe_size - 1;j++) {
-        UPERBuffer[tail].chosen = true;
-        stripesum += UPERBuffer[tail].uper;
-        tail--;
-        if (stripesum + UPERBuffer[tail].uper > target) {
-            j++;
-            break;
-        }
-    }
-    // select smallest upers until chosen (stripesize - 1) lines
-    for (;j < spp->rain_stripe_size - 1;j++) {
-        UPERBuffer[head].chosen = true;
-        stripesum += UPERBuffer[head].uper;
-        head++;
-    }
-    // decide the last uper which adds up closest to target
-    double delta = 1 + sum, lasttarget = target - stripesum;
-    int k = head;
-    for (;k <= tail;k++) {
-        double d = fabs(UPERBuffer[k].uper - lasttarget);
-        if (d >= delta) {
-            // uper is ascending, so the previous uper is closest
-            break;
-        }
-        delta = d;
-    }
-    // select the previous one
-    k -= 1;
-    UPERBuffer[k].chosen = true;
-
-    head = tail = 0;
-    a->upersum = b->upersum = 0;
-    for (int i = 0;i < spp->rain_stripe_size * 2;i += 1) {
-        if (UPERBuffer[i].chosen) {
-            stripe2line[a->stripeindex + head] = UPERBuffer[i].lineid;
-            line2stripe[UPERBuffer[i].lineid] = a->stripeindex + head;
-            lineuper[UPERBuffer[i].lineid] = UPERBuffer[i].uper;
-            a->upersum += UPERBuffer[i].uper;
-            head += 1;
-        } else {
-            stripe2line[b->stripeindex + tail] = UPERBuffer[i].lineid;
-            line2stripe[UPERBuffer[i].lineid] = b->stripeindex + tail;
-            lineuper[UPERBuffer[i].lineid] = UPERBuffer[i].uper;
-            b->upersum += UPERBuffer[i].uper;
-            tail += 1;
-        }
-    }
-    assert(head == tail && head == spp->rain_stripe_size);
-}
-
-static void MoveColdData(struct ssd* ssd, StripeInfo* ColdStripe, StripeInfo* FreeStripe, bool reforging) {
-    struct ssdparams* spp = &ssd->sp;
-    int linecnt = 1;
-    if (reforge == 2) {
-        linecnt = spp->rain_stripe_size;
-    }
     // move all valid and invalid data
-    FreeStripe->ipc = ColdStripe->ipc;
-    FreeStripe->vpc = ColdStripe->vpc;
-    if (ColdStripe->vpc == spp->pgs_per_line * linecnt) {
-        assert(ColdStripe->victimPos == 0);
-        QTAILQ_REMOVE(&fullStripeList, ColdStripe, entry);
-        QTAILQ_INSERT_TAIL(&fullStripeList, FreeStripe, entry);
+    free->ipc = cold->ipc;
+    free->vpc = cold->vpc;
+    if (cold->vpc == spp->pgs_per_line * spp->rain_stripe_size) {
+        assert(cold->victimPos == 0);
+        QTAILQ_REMOVE(&fullStripeList, cold, entry);
+        QTAILQ_INSERT_TAIL(&fullStripeList, free, entry);
     } else {
-        assert(ColdStripe->victimPos > 0);
-        pqueue_remove(victimStripePQ, ColdStripe);
-        pqueue_insert(victimStripePQ, FreeStripe);
-        ColdStripe->victimPos = 0;
+        assert(cold->victimPos > 0);
+        pqueue_remove(victimStripePQ, cold);
+        pqueue_insert(victimStripePQ, free);
+        cold->victimPos = 0;
     }
-    if (reforge == 2) {
-        pqueue_insert(writtenMinUPERPQ, FreeStripe);
-    } else {
-        pqueue_insert(writtenMinECPQ, FreeStripe);
-    }
-    ColdStripe->ipc = 0;
-    ColdStripe->vpc = 0;
+    pqueue_insert(writtenMinPQ, free);
+    cold->ipc = 0;
+    cold->vpc = 0;
 
     double newsum = 0.0;
     // move all lines in stripe
-    for (int offset = 0;offset < linecnt;offset += 1) {
-        int coldlineid = stripe2line[ColdStripe->stripeindex + offset];
-        int freelineid = stripe2line[FreeStripe->stripeindex + offset];
+    for (int offset = 0;offset < spp->rain_stripe_size;offset += 1) {
+        int coldlineid = stripe2line[cold->stripeindex + offset];
+        int freelineid = stripe2line[free->stripeindex + offset];
         struct line* coldline = lineinfo[coldlineid].ln;
         struct line* freeline = lineinfo[freelineid].ln;
         struct ppa coldppa, freeppa;
@@ -1289,8 +1047,7 @@ static void MoveColdData(struct ssd* ssd, StripeInfo* ColdStripe, StripeInfo* Fr
         lineuper[coldlineid] = UPER(lineinfo[coldlineid].erasecount);
         newsum += lineuper[coldlineid];
     }
-    UPERsum += (newsum - ColdStripe->upersum);
-    ColdStripe->upersum = newsum;
+    cold->upersum = newsum;
 }
 
 static void mark_stripe_free(struct ssd* ssd, struct ppa* ppa)
@@ -1298,77 +1055,28 @@ static void mark_stripe_free(struct ssd* ssd, struct ppa* ppa)
     struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct line* line = get_line(ssd, ppa);
-
-    int linecnt = 1;
-    int sid = line2stripe[line->id];
-    if (reforge == 2) {
-        linecnt = spp->rain_stripe_size;
-        sid /= ssd->sp.rain_stripe_size;
-    }
+    int sid = line2stripe[line->id] / ssd->sp.rain_stripe_size;
     StripeInfo* stripe = &stripeinfo[sid];
     stripe->ipc = 0;
     stripe->vpc = 0;
 
-    if (reforge == 2) {
-        if (spp->superl > 0) {
-            StripeInfo* curr = &stripeinfo[sid];
-            StripeInfo* maxfree = pqueue_peek(freeMaxUPERPQ);
-            if (maxfree != NULL && curr->upersum > maxfree->upersum) {
-                // curr has largest upersum, swap with smallest
-                StripeInfo* minfree = pqueue_pop(freeMinUPERPQ);
-                pqueue_remove(freeMaxUPERPQ, minfree);
-                SwapFreeStripe(ssd, minfree, curr);
-                swapFreeCount += 1;
-                pqueue_insert(freeMinUPERPQ, minfree);
-                pqueue_insert(freeMaxUPERPQ, minfree);
-            }
-            pqueue_insert(freeMinUPERPQ, curr);
-            pqueue_insert(freeMaxUPERPQ, curr);
-
-            maxfree = pqueue_peek(freeMaxUPERPQ);
-            StripeInfo* minwritten = pqueue_peek(writtenMinUPERPQ);
-            if (minwritten != NULL && maxfree->upersum > minwritten->upersum * 2) {
-                // largest uper > (smallest victim uper * 2), move data
-                pqueue_pop(writtenMinUPERPQ);
-                pqueue_pop(freeMaxUPERPQ);
-                pqueue_remove(freeMinUPERPQ, maxfree);
-                MoveColdData(ssd, minwritten, maxfree, false);
-                clearFullCount += 1;
-                // now minwritten is free, swap with largest
-                maxfree = pqueue_peek(freeMaxUPERPQ);
-                if (maxfree != NULL) {
-                    pqueue_pop(freeMaxUPERPQ);
-                    pqueue_remove(freeMinUPERPQ, maxfree);
-                    SwapFreeStripe(ssd, minwritten, maxfree);
-                    pqueue_insert(freeMinUPERPQ, maxfree);
-                    pqueue_insert(freeMaxUPERPQ, maxfree);
-                }
-                pqueue_insert(freeMinUPERPQ, minwritten);
-                pqueue_insert(freeMaxUPERPQ, minwritten);
-            }
+    if (spp->pwl > 0) {
+        // do wear leveling according to threshold
+        double avgEC = (double)gcCount / totalStripes;
+        double threshold = avgEC * (100 - spp->pwl) / 100 + (double)RAINCycleLimit * (spp->pwl) / 100;
+        LineInfo* curr = &lineinfo[line->id];
+        if (curr->erasecount > threshold) {
+            StripeInfo* minwritten = pqueue_pop(writtenMinPQ);
+            minwritten->writtenMinPos = 0;
+            MoveColdData(ssd, minwritten, stripe);
+            QTAILQ_INSERT_TAIL(&freeStripeList, minwritten, entry);
         } else {
             QTAILQ_INSERT_TAIL(&freeStripeList, stripe, entry);
         }
     } else {
-        if (spp->pwl > 0) {
-            // do wear leveling according to threshold
-            double avgEC = (double)gcCount / spp->tt_lines;
-            double threshold = avgEC * (100 - spp->pwl) / 100 + (double)CYCLELIMIT * (spp->pwl) / 100;
-            LineInfo* curr = &lineinfo[line->id];
-            if (curr->erasecount > threshold) {
-                StripeInfo* minwritten = pqueue_pop(writtenMinECPQ);
-                minwritten->writtenMinPos = 0;
-                MoveColdData(ssd, minwritten, stripe, false);
-                QTAILQ_INSERT_TAIL(&freeStripeList, minwritten, entry);
-            } else {
-                QTAILQ_INSERT_TAIL(&freeStripeList, stripe, entry);
-            }
-        } else {
-            /* move this line to free line list */
-            QTAILQ_INSERT_TAIL(&freeStripeList, stripe, entry);
-        }
+        QTAILQ_INSERT_TAIL(&freeStripeList, stripe, entry);
     }
-    lm->free_line_cnt += linecnt;
+    lm->free_line_cnt += spp->rain_stripe_size;
 }
 
 static int do_gc(struct ssd* ssd, bool force)
@@ -1382,16 +1090,11 @@ static int do_gc(struct ssd* ssd, bool force)
         return -1;
     }
 
-    int linecnt = 1, eclimit = CYCLELIMIT;
-    if (reforge == 2) {
-        linecnt = spp->rain_stripe_size;
-        eclimit = RAINCycleLimit;
-    }
     struct ppa ppa;
     ppa.ppa = 0;
     double newsum = 0.0;
     // GC all lines in stripe
-    for (int offset = 0;offset < linecnt;offset += 1) {
+    for (int offset = 0;offset < spp->rain_stripe_size;offset += 1) {
         int lineid = stripe2line[victim_stripe->stripeindex + offset];
         ppa.ppa = 0;
         ppa.g.blk = lineid;
@@ -1426,409 +1129,19 @@ static int do_gc(struct ssd* ssd, bool force)
         lineuper[lineid] = UPER(lineinfo[lineid].erasecount);
         newsum += lineuper[lineid];
     }
-    UPERsum += (newsum - victim_stripe->upersum);
     victim_stripe->upersum = newsum;
     gcCount += 1;
     mark_stripe_free(ssd, &ppa);
 
-    if (gcCount % (spp->tt_lines / linecnt * 10) == 0) {
+    if (gcCount % (totalStripes * 10) == 0) {
         int cycles = ssdPageWrites / spp->tt_pgs;
-        fprintf(outfp, "\ncycles %d cyclelimit %d gccount %d swapfree %d clearfull %d\n", cycles, eclimit, gcCount, swapFreeCount, clearFullCount);
+        fprintf(outfp, "\ncycles %d cyclelimit %d gccount %d\n", cycles, RAINCycleLimit, gcCount);
         fprintf(outfp, "hostpages %lu ssdpages %lu gcpages %lu paritypages %lu wlpages %lu WAF %e\n", hostPageWrites, ssdPageWrites, GCPageWrites, parityPageWrites, PWLPageWrites, (double)ssdPageWrites / hostPageWrites);
-        fprintf(outfp, "upersum %e target %e\n", UPERsum, UPERsum / (spp->tt_lines / linecnt));
         dumpBlocks(ssd);
         fflush(outfp);
     }
 
     return 0;
-}
-
-static void StaticStripes(struct ssd* ssd) {
-    struct ssdparams* spp = &ssd->sp;
-
-    // find (totalStripes + spp->rain_stripe_size - 1) free lines
-    int parityCount = 0;
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        if (LineECBuffer[i].isfree) {
-            LineECBuffer[i].isparity = true;
-            parityCount += 1;
-            if (parityCount >= totalStripes + spp->rain_stripe_size - 1) {
-                break;
-            }
-        }
-    }
-    assert(parityCount == totalStripes + spp->rain_stripe_size - 1);
-
-    // 1 free line + fulllines
-    int fullhead = 0, freehead = 0;
-    int curr = 0;
-    while (fullhead < spp->tt_lines && LineECBuffer[fullhead].isparity) {
-        fullhead += 1;
-    }
-    while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-        freehead += 1;
-    }
-    assert((!LineECBuffer[fullhead].isparity) && LineECBuffer[freehead].isparity);
-    // select the first free stripe
-    for (int j = 0;j < spp->rain_stripe_size;j += 1) {
-        stripe2line[curr + j] = LineECBuffer[freehead].lineid;
-        line2stripe[LineECBuffer[freehead].lineid] = curr + j;
-
-        freehead += 1;
-        while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-            freehead += 1;
-        }
-    }
-    curr += spp->rain_stripe_size;
-    // select 1 free line each step
-    for (int i = 0;i < totalStripes - 1;i += 1) {
-        for (int j = 0;j < spp->rain_stripe_size - 1;j += 1) {
-            stripe2line[curr + j] = LineECBuffer[fullhead].lineid;
-            line2stripe[LineECBuffer[fullhead].lineid] = curr + j;
-
-            fullhead += 1;
-            while (fullhead < spp->tt_lines && LineECBuffer[fullhead].isparity) {
-                fullhead += 1;
-            }
-        }
-        stripe2line[curr + spp->rain_stripe_size - 1] = LineECBuffer[freehead].lineid;
-        line2stripe[LineECBuffer[freehead].lineid] = curr + spp->rain_stripe_size - 1;
-
-        freehead += 1;
-        while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-            freehead += 1;
-        }
-
-        curr += spp->rain_stripe_size;
-    }
-    assert(freehead == spp->tt_lines && fullhead == spp->tt_lines);
-
-    // verify stripes
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        LineECBuffer[i].isparity = false;
-    }
-    curr = 0;
-    while (curr < spp->tt_lines) {
-        int freelines = 0;
-        for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-            int lineid = stripe2line[curr + o];
-            assert(line2stripe[lineid] == curr + o);
-            if (stripeinfo[lineid].vpc == 0 && stripeinfo[lineid].ipc == 0) {
-                freelines += 1;
-            }
-            // make sure each line is in only 1 stripe
-            assert(!LineECBuffer[lineid].isparity);
-            LineECBuffer[lineid].isparity = true;
-        }
-        assert(freelines >= 1);
-        if (curr == 0) {
-            // free stripe
-            assert(freelines == spp->rain_stripe_size);
-        }
-        curr += spp->rain_stripe_size;
-    }
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        assert(LineECBuffer[i].isparity);
-    }
-}
-
-static void BuildStripes(struct ssd* ssd) {
-    struct ssdparams* spp = &ssd->sp;
-
-    int parityCount = 0, freetail = -1;
-    for (int i = spp->tt_lines - 1;i >= 0 && parityCount < totalStripes;i -= 1) {
-        if (LineECBuffer[i].isfree) {
-            if (freetail < 0) {
-                freetail = i;
-            }
-            // select free lines from tail for parity
-            LineECBuffer[i].isparity = true;
-            parityCount += 1;
-        }
-    }
-    assert(parityCount == totalStripes);
-    // select (stripesize - 1) lines for the free stripe
-    for (int i = 0;i < spp->tt_lines && parityCount < totalStripes + spp->rain_stripe_size - 1;i += 1) {
-        if (LineECBuffer[i].isfree) {
-            assert(!LineECBuffer[i].isparity);
-            LineECBuffer[i].isparity = true;
-            parityCount += 1;
-        }
-    }
-    assert(parityCount == totalStripes + spp->rain_stripe_size - 1);
-
-    // 1 old + young, select 1 parity each step
-    int fullhead = 0, freehead = 0;
-    int curr = 0, tail = spp->tt_lines - 1;
-    while (fullhead < spp->tt_lines && LineECBuffer[fullhead].isparity) {
-        fullhead += 1;
-    }
-    while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-        freehead += 1;
-    }
-    assert((!LineECBuffer[fullhead].isparity) && LineECBuffer[freehead].isparity);
-    // select the first free stripe
-    stripe2line[curr + spp->rain_stripe_size - 1] = LineECBuffer[freetail].lineid;
-    line2stripe[LineECBuffer[freetail].lineid] = curr + spp->rain_stripe_size - 1;
-    for (int j = 0;j < spp->rain_stripe_size - 1;j += 1) {
-        stripe2line[curr + j] = LineECBuffer[freehead].lineid;
-        line2stripe[LineECBuffer[freehead].lineid] = curr + j;
-
-        freehead += 1;
-        while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-            freehead += 1;
-        }
-    }
-    curr += spp->rain_stripe_size;
-    // select 1 free line each step
-    for (int i = 0;i < totalStripes - 1;i += 1) {
-        if (tail == freetail) {
-            tail -= 1;
-        }
-        if (LineECBuffer[tail].isparity) {
-            // 1 old parity + (n - 1) young full
-            stripe2line[curr + spp->rain_stripe_size - 1] = LineECBuffer[tail].lineid;
-            line2stripe[LineECBuffer[tail].lineid] = curr + spp->rain_stripe_size - 1;
-            for (int j = 0;j < spp->rain_stripe_size - 1;j += 1) {
-                stripe2line[curr + j] = LineECBuffer[fullhead].lineid;
-                line2stripe[LineECBuffer[fullhead].lineid] = curr + j;
-
-                fullhead += 1;
-                while (fullhead < spp->tt_lines && LineECBuffer[fullhead].isparity) {
-                    fullhead += 1;
-                }
-            }
-        } else {
-            // 1 old full + 1 young parity + (n - 2) young full
-            for (int j = 0;j < spp->rain_stripe_size - 2;j += 1) {
-                stripe2line[curr + j] = LineECBuffer[fullhead].lineid;
-                line2stripe[LineECBuffer[fullhead].lineid] = curr + j;
-
-                fullhead += 1;
-                while (fullhead < spp->tt_lines && LineECBuffer[fullhead].isparity) {
-                    fullhead += 1;
-                }
-            }
-            stripe2line[curr + spp->rain_stripe_size - 2] = LineECBuffer[tail].lineid;
-            line2stripe[LineECBuffer[tail].lineid] = curr + spp->rain_stripe_size - 2;
-
-            stripe2line[curr + spp->rain_stripe_size - 1] = LineECBuffer[freehead].lineid;
-            line2stripe[LineECBuffer[freehead].lineid] = curr + spp->rain_stripe_size - 1;
-
-            freehead += 1;
-            while (freehead < spp->tt_lines && !LineECBuffer[freehead].isparity) {
-                freehead += 1;
-            }
-        }
-        curr += spp->rain_stripe_size;
-        tail -= 1;
-    }
-    
-    // verify stripes
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        LineECBuffer[i].isparity = false;
-    }
-    curr = 0;
-    while (curr < spp->tt_lines) {
-        int freelines = 0;
-        for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-            int lineid = stripe2line[curr + o];
-            assert(line2stripe[lineid] == curr + o);
-            if (stripeinfo[lineid].vpc == 0 && stripeinfo[lineid].ipc == 0) {
-                freelines += 1;
-            }
-            // make sure each line is in only 1 stripe
-            assert(!LineECBuffer[lineid].isparity);
-            LineECBuffer[lineid].isparity = true;
-        }
-        assert(freelines >= 1);
-        if (curr == 0) {
-            // free stripe
-            assert(freelines == spp->rain_stripe_size);
-        }
-        curr += spp->rain_stripe_size;
-    }
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        assert(LineECBuffer[i].isparity);
-    }
-}
-
-static void reforgeSSD(struct ssd* ssd) {
-    struct ssdparams* spp = &ssd->sp;
-    struct line_mgmt* lm = &ssd->lm;
-    struct write_pointer* wpp = &ssd->wp;
-
-    reforge = 1;
-    // do gc until enough free lines for parity
-    uint64_t gcPages = GCPageWrites;
-    int gccnt = gcCount;
-    fprintf(outfp, "\nstartreforgefreelines %d victimlines %d fulllines %d\n", lm->free_line_cnt, lm->victim_line_cnt, lm->full_line_cnt);
-    while (lm->free_line_cnt < totalStripes + spp->rain_stripe_size - 1) {
-        do_gc(ssd, true);
-        gcCount += 1;
-    }
-    fprintf(outfp, "startreforgegccount %d reforgegcpages %lu freelines %d\n", gcCount - gccnt, GCPageWrites - gcPages, lm->free_line_cnt);
-    // find free lines for parity
-    int freelines = 0;
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        LineECBuffer[i].lineid = i;
-        LineECBuffer[i].erasecount = lineinfo[i].erasecount;
-        if (stripeinfo[i].vpc == 0 && stripeinfo[i].ipc == 0) {
-            LineECBuffer[i].isfree = true;
-            freelines += 1;
-        } else {
-            LineECBuffer[i].isfree = false;
-        }
-        LineECBuffer[i].isparity = false;
-    }
-    assert(freelines >= totalStripes + spp->rain_stripe_size - 1);
-    if (spp->superl < 0) {
-        // static stripe layout
-        StaticStripes(ssd);
-    } else {
-        // sort lines according to erase count and build stripes
-        qsort(LineECBuffer, spp->tt_lines, sizeof(LineStatus), CmpEC);
-        BuildStripes(ssd);
-    }
-
-    // write parity for valid pages
-    int curr = 0;
-    while (curr < spp->tt_lines) {
-        struct ppa currppa;
-        currppa.ppa = 0;
-        for (int currblk = 0;currblk < spp->blks_per_line;currblk += 1) {
-            for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
-                currppa.g.pg = pg;
-                int validcnt = 0;
-                // read written pages and write parity if this page level stripe has valid page
-                for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-                    int lineid = stripe2line[curr + o];
-                    currppa.g.blk = lineid;
-                    struct nand_page* currpage = get_pg(ssd, &currppa);
-                    if (curr == 0) {
-                        assert(stripeinfo[lineid].vpc == 0 && stripeinfo[lineid].ipc == 0);
-                        assert(currpage->status == PG_FREE);
-                    }
-                    if (o < spp->rain_stripe_size - 1) {
-                        if (currpage->status == PG_VALID) {
-                            gc_read_page(ssd, &currppa);
-                            validcnt += 1;
-                        } else if (currpage->status == PG_INVALID) {
-                            gc_read_page(ssd, &currppa);
-                        }
-                    } else {
-                        assert(currpage->status == PG_FREE);
-                        if (validcnt > 0) {
-                            new_parity_write_page(ssd, &currppa, PARITYLPN);
-                            ssdPageWrites += 1;
-                        }
-                    }
-                }
-            }
-            currppa.g.ch += 1;
-            if (currppa.g.ch == spp->nchs) {
-                currppa.g.lun += 1;
-                currppa.g.ch = 0;
-            }
-        }
-        curr += spp->rain_stripe_size;
-    }
-    fprintf(outfp, "reforgewriteparitypages %ld\n", parityPageWrites);
-
-    // update global info
-    for (int i = 0;i < spp->tt_lines;i += 1) {
-        lm->lines[i].ipc = stripeinfo[i].ipc;
-        lm->lines[i].vpc = stripeinfo[i].vpc;
-    }
-    double maxupersum = 0, minupersum = 0;
-    UPERsum = currErrorRate = 0;
-    lm->free_line_cnt = lm->victim_line_cnt = lm->full_line_cnt = 0;
-    QTAILQ_INIT(&freeStripeList);
-    victimStripePQ->size = 1;
-    QTAILQ_INIT(&fullStripeList);
-    for (int i = 0;i < totalStripes;i += 1) {
-        // update stripeinfo
-        int stripeindex = i * spp->rain_stripe_size;
-        stripeinfo[i].stripeindex = stripeindex;
-        stripeinfo[i].ipc = stripeinfo[i].vpc = 0;
-        stripeinfo[i].upersum = 0;
-        stripeinfo[i].victimPos = stripeinfo[i].writtenMinPos = 0;
-        double minus = 0;
-        for (int o = 0;o < spp->rain_stripe_size;o += 1) {
-            int lineid = stripe2line[stripeindex + o];
-            if (i == 0) {
-                assert(lm->lines[lineid].vpc == 0 && lm->lines[lineid].ipc == 0);
-            }
-            stripeinfo[i].ipc += lm->lines[lineid].ipc;
-            stripeinfo[i].vpc += lm->lines[lineid].vpc;
-            assert(lineuper[lineid] == UPER(lineinfo[lineid].erasecount));
-            stripeinfo[i].upersum += lineuper[lineid];
-            minus += lineuper[lineid] * lineuper[lineid];
-        }
-
-        if (i > 0) {
-            if (i == 1 || stripeinfo[i].upersum < minupersum) {
-                minupersum = stripeinfo[i].upersum;
-            }
-            if (i == 1 || stripeinfo[i].upersum > maxupersum) {
-                maxupersum = stripeinfo[i].upersum;
-            }
-        } else {
-            assert(stripeinfo[i].vpc == 0 && stripeinfo[i].ipc == 0);
-        }
-        UPERsum += stripeinfo[i].upersum;
-        currErrorRate += (stripeinfo[i].upersum * stripeinfo[i].upersum - minus) / 2;
-
-        if (stripeinfo[i].vpc == 0 && stripeinfo[i].ipc == 0) {
-            // free stripe
-            lm->free_line_cnt += spp->rain_stripe_size;
-            if (spp->superl > 0) {
-                pqueue_insert(freeMaxUPERPQ, &stripeinfo[i]);
-                pqueue_insert(freeMinUPERPQ, &stripeinfo[i]);
-            } else {
-                QTAILQ_INSERT_TAIL(&freeStripeList, &stripeinfo[i], entry);
-            }
-        } else if (stripeinfo[i].vpc == spp->pgs_per_line * spp->rain_stripe_size) {
-            // full stripe
-            assert(stripeinfo[i].ipc == 0);
-            lm->full_line_cnt += spp->rain_stripe_size;
-            pqueue_insert(writtenMinUPERPQ, &stripeinfo[i]);
-            QTAILQ_INSERT_TAIL(&fullStripeList, &stripeinfo[i], entry);
-        } else {
-            // victim stripe
-            if (stripeinfo[i].ipc == 0) {
-                int d = stripeinfo[i].vpc / spp->pgs_per_line, r = stripeinfo[i].vpc % spp->pgs_per_line;
-                assert(r == 0 && d > 1);
-            }
-            assert(stripeinfo[i].vpc < spp->pgs_per_line * spp->rain_stripe_size);
-            lm->victim_line_cnt += spp->rain_stripe_size;
-            pqueue_insert(writtenMinUPERPQ, &stripeinfo[i]);
-            pqueue_insert(victimStripePQ, &stripeinfo[i]);
-        }
-    }
-    currErrorRate = currErrorRate / spp->tt_lines * RAINlogicalPages;
-    fprintf(outfp, "freeupersum %e maxupersum %e minupersum %e\n", stripeinfo[0].upersum, maxupersum, minupersum);
-    fprintf(outfp, "currErrorRate %e upersum %e\n", currErrorRate, UPERsum);
-    fprintf(outfp, "endreforgefreelines %d victimlines %d fulllines %d\n", lm->free_line_cnt, lm->victim_line_cnt, lm->full_line_cnt);
-    fflush(outfp);
-
-    // update write pointer
-    reforge = 2;
-    wpp->curline = get_next_free_line(ssd);
-    wpp->ch = 0;
-    wpp->lun = 0;
-    wpp->pl = 0;
-    wpp->blk = wpp->curline->id;
-    wpp->pg = 0;
-    
-    // do gc until free ratio is normal
-    gccnt = gcCount;
-    gcPages = GCPageWrites;
-    while (should_gc_high(ssd)) {
-        do_gc(ssd, true);
-        gcCount += 1;
-    }
-    fprintf(outfp, "endreforgegccount %d reforgegcpages %lu freelines %d\n", gcCount - gccnt, GCPageWrites - gcPages, lm->free_line_cnt);
 }
 
 static uint64_t ssd_read(struct ssd* ssd, NvmeRequest* req)
@@ -1974,10 +1287,7 @@ static void ResetState(struct ssd* ssd) {
         // QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     }
 
-    writtenMinECPQ->size = 1;
-    freeMinUPERPQ->size = 1;
-    freeMaxUPERPQ->size = 1;
-    writtenMinUPERPQ->size = 1;
+    writtenMinPQ->size = 1;
     for (int i = 0;i < spp->tt_lines;i += 1) {
         lineinfo[i].ln = &lm->lines[i];
         lineinfo[i].erasecount = 0;
@@ -1988,25 +1298,23 @@ static void ResetState(struct ssd* ssd) {
     victimStripePQ->size = 1;
     QTAILQ_INIT(&fullStripeList);
     double init = UPER(0);
-    for (int i = 0;i < spp->tt_lines;i += 1) {
+    for (int i = 0;i < totalStripes;i += 1) {
         stripeinfo[i].ipc = stripeinfo[i].vpc = 0;
-        stripeinfo[i].stripeindex = i;
-        stripeinfo[i].upersum = init;
-        stripeinfo[i].victimPos = stripeinfo[i].writtenMinPos = stripeinfo[i].freeMaxPos = stripeinfo[i].freeMinPos = 0;
+        stripeinfo[i].stripeindex = i * spp->rain_stripe_size;
+        stripeinfo[i].upersum = init * spp->rain_stripe_size;
+        stripeinfo[i].victimPos = stripeinfo[i].writtenMinPos = 0;
         QTAILQ_INSERT_TAIL(&freeStripeList, &stripeinfo[i], entry);
     }
     for (int i = 0;i < spp->tt_lines;i += 1) {
         line2stripe[i] = stripe2line[i] = i;
         lineuper[i] = init;
     }
-    UPERsum = init * spp->tt_lines;
 
     ssd_init_write_pointer(ssd);
 
-    gcCount = currStripeOffset = swapFreeCount = clearFullCount = 0;
+    gcCount = currStripeOffset = 0;
     hostPageWrites = ssdPageWrites = GCPageWrites = parityPageWrites = PWLPageWrites = 0;
     currErrorRate = 0;
-    reforge = 0;
 }
 
 static QemuThread trace_thread;
@@ -2026,7 +1334,7 @@ static void* trace(void* arg) {
     int diskid = 0;
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/disk%dprefillReforgePWL%dSUPERL%d", n->tracediskGB, diskid, n->pwl, n->superl);
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/disk%dprefillPPNRAINPWL%d", n->tracediskGB, diskid, n->pwl);
         outfp = fopen(buf, "w");
         printf("outfile %s\n", buf);
 
