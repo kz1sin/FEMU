@@ -59,18 +59,18 @@ static double DevicePFail(struct ssd* ssd) {
     struct ssdparams* spp = &ssd->sp;
     struct line_mgmt* lm = &ssd->lm;
     struct nand_plane* pl = &ssd->ch[0].lun[0].pl[0];
-    double p = 0, maxuper = 0, minuper = 0;
+    double p = 0, maxuper = -1, minuper = -1;
     int maxuperline = 0, minuperline = 0;
     int validLines = 0;
     for (int b = 0; b < spp->tt_lines; b++) {
         if (lm->lines[b].vpc != -1) {
             // not markout line
             double uper = UPER(pl->blk[b].erase_cnt);
-            if (b == 0 || uper > maxuper) {
+            if (maxuper < 0 || uper > maxuper) {
                 maxuper = uper;
                 maxuperline = b;
             }
-            if (b == 0 || uper < minuper) {
+            if (minuper < 0 || uper < minuper) {
                 minuper = uper;
                 minuperline = b;
             }
@@ -444,7 +444,7 @@ static void ssd_init_params(struct ssdparams* spp, FemuCtrl* n)
     logicalPages = spp->parity_start_lpn;
     targetErrorRate = UPER(CYCLELIMIT) * logicalPages;
     int logicalLines = logicalPages / spp->pgs_per_line;
-    markoutLimit = logicalLines / (spp->rain_stripe_size - 1); // same capacity ratio as parity
+    markoutLimit = spp->tt_lines / spp->rain_stripe_size; // same capacity ratio as parity
     assert(logicalLines + markoutLimit + spp->gc_thres_lines_high < spp->tt_lines);
 
     check_params(spp);
