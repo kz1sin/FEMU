@@ -1213,9 +1213,7 @@ static void ResetState(struct ssd* ssd) {
 
 static QemuThread trace_thread;
 
-static void* trace(void* arg) {
-    sleep(30);
-    FemuCtrl* n = (FemuCtrl*)arg;
+static void DiskTrace(FemuCtrl* n) {
     struct ssd* ssd = n->ssd;
     uint64_t offset = 0, len = 0;
     NvmeRequest rq;
@@ -1269,58 +1267,73 @@ static void* trace(void* arg) {
         ResetState(ssd);
     }
     fclose(fp);
+}
 
+static void SynthTrace(FemuCtrl* n) {
+    struct ssd* ssd = n->ssd;
+    uint64_t offset = 0, len = 0;
+    NvmeRequest rq;
+    rq.stime = 0;
 
-    // int traceCycle = 4;
-    // char buf[256];
-    // sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/diskids%d", traceCycle, n->rain_stripe_size - 1, n->tracefile);
-    // printf("tracefile %s\n", buf);
+    int traceCycle = 20;
+    char buf[256];
+    sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/diskids%d", traceCycle, n->rain_stripe_size - 1, n->tracefile);
+    printf("tracefile %s\n", buf);
 
-    // int full = 0;
-    // FILE* fp = fopen(buf, "r");
-    // while (fscanf(fp, "%d", &full) != EOF) {
-    //     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/ECCPWL%dfull%d", traceCycle, n->rain_stripe_size - 1, n->pwl, full);
-    //     outfp = fopen(buf, "w");
-    //     printf("outfile %s\n", buf);
+    int full = 0;
+    FILE* fp = fopen(buf, "r");
+    while (fscanf(fp, "%d", &full) != EOF) {
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/ECCPWL%dfull%d", traceCycle, n->rain_stripe_size - 1, n->pwl, full);
+        outfp = fopen(buf, "w");
+        printf("outfile %s\n", buf);
 
-    //     int prefillmb = 20 * 1024 * full / 100;
-    //     for (int mb = 0;mb < prefillmb;mb += 1) {
-    //         offset = (uint64_t)mb * 1024 * 1024;
-    //         len = 1024 * 1024;
-    //         rq.slba = offset / ssd->sp.secsz;
-    //         rq.nlb = len / ssd->sp.secsz;
+        int prefillmb = 20 * 1024 * full / 100;
+        for (int mb = 0;mb < prefillmb;mb += 1) {
+            offset = (uint64_t)mb * 1024 * 1024;
+            len = 1024 * 1024;
+            rq.slba = offset / ssd->sp.secsz;
+            rq.nlb = len / ssd->sp.secsz;
 
-    //         ssd_write(ssd, &rq);
-    //         if (should_gc(ssd)) {
-    //             do_gc(ssd, false);
-    //         }
-    //     }
-    //     printf("\nprefill %d MB\n", prefillmb);
+            ssd_write(ssd, &rq);
+            if (should_gc(ssd)) {
+                do_gc(ssd, false);
+            }
+        }
+        printf("\nprefill %d MB\n", prefillmb);
 
-    //     while (currErrorRate < targetErrorRate) {
-    //         sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycletrace", traceCycle);
-    //         FILE* fpin = fopen(buf, "r");
-    //         while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
-    //             rq.slba = offset / ssd->sp.secsz;
-    //             rq.nlb = len / ssd->sp.secsz;
+        while (currErrorRate < targetErrorRate) {
+            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycletrace", traceCycle);
+            FILE* fpin = fopen(buf, "r");
+            while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
+                rq.slba = offset / ssd->sp.secsz;
+                rq.nlb = len / ssd->sp.secsz;
 
-    //             ssd_write(ssd, &rq);
-    //             if (should_gc(ssd)) {
-    //                 do_gc(ssd, false);
-    //             }
+                ssd_write(ssd, &rq);
+                if (should_gc(ssd)) {
+                    do_gc(ssd, false);
+                }
 
-    //             if (currErrorRate >= targetErrorRate) {
-    //                 break;
-    //             }
-    //         }
-    //         fclose(fpin);
-    //     }
-    //     fflush(outfp);
-    //     fclose(outfp);
-    //     ResetState(ssd);
-    // }
-    // fclose(fp);
+                if (currErrorRate >= targetErrorRate) {
+                    break;
+                }
+            }
+            fclose(fpin);
+        }
+        fflush(outfp);
+        fclose(outfp);
+        ResetState(ssd);
+    }
+    fclose(fp);
+}
 
+static void* trace(void* arg) {
+    sleep(30);
+    FemuCtrl* n = (FemuCtrl*)arg;
+    if (n->tracediskGB > 0) {
+        DiskTrace(n);
+    } else {
+        SynthTrace(n);
+    }
     abort();
 
     return NULL;
