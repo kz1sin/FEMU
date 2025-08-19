@@ -1275,7 +1275,7 @@ static void SynthTrace(FemuCtrl* n) {
     NvmeRequest rq;
     rq.stime = 0;
 
-    int traceCycle = 20;
+    int traceCycle = 4;
     char buf[256];
     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/diskids%d", traceCycle, n->rain_stripe_size - 1, n->tracefile);
     printf("tracefile %s\n", buf);

@@ -129,16 +129,18 @@ static double DevicePFail(struct ssd* ssd) {
     } else {
         // ECC lines UPER
         int validLines = 0;
+        maxupersum = -1;
+        minupersum = -1;
         for (int s = 0; s < spp->tt_lines; s++) {
             if (lm->lines[s].vpc != -1) {
                 // not markout line
                 double stripeuper = stripeinfo[s].upersum;
                 assert(stripeuper == UPER(lineinfo[s].erasecount));
-                if (s == 0 || stripeuper > maxupersum) {
+                if (maxupersum < 0 || stripeuper > maxupersum) {
                     maxupersum = stripeuper;
                     maxupersumstripe = s;
                 }
-                if (s == 0 || stripeuper < minupersum) {
+                if (minupersum < 0 || stripeuper < minupersum) {
                     minupersum = stripeuper;
                     minupersumstripe = s;
                 }
@@ -1891,7 +1893,7 @@ static void reforgeSSD(struct ssd* ssd) {
         do_gc(ssd, true);
         gcCount += 1;
     }
-    fprintf(outfp, "endreforgegccount %d reforgegcpages %lu %lu freelines %d\n", gcCount - gccnt, gcPages, GCPageWrites, lm->free_line_cnt);
+    fprintf(outfp, "endreforgegccount %d reforgegcpages %lu freelines %d\n", gcCount - gccnt, GCPageWrites - gcPages, lm->free_line_cnt);
 }
 
 static uint64_t ssd_read(struct ssd* ssd, NvmeRequest* req)
@@ -2136,7 +2138,7 @@ static void SynthTrace(FemuCtrl* n) {
     NvmeRequest rq;
     rq.stime = 0;
 
-    int traceCycle = 20;
+    int traceCycle = 4;
     char buf[256];
     sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/diskids%d", traceCycle, n->rain_stripe_size - 1, n->tracefile);
     printf("tracefile %s\n", buf);
