@@ -543,8 +543,8 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
 
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
 
-    if (bs_size > 2ul * 1024 * 1024 * 1024) {
-        bs_size = 2ul * 1024 * 1024 * 1024;
+    if (bs_size > 20ul * 1024 * 1024) {
+        bs_size = 20ul * 1024 * 1024;
     }
 
     int ps = n->bb_params.secsz * n->bb_params.secs_per_pg;

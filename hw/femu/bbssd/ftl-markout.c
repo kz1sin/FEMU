@@ -1275,36 +1275,28 @@ static void SynthTrace(FemuCtrl* n) {
     NvmeRequest rq;
     rq.stime = 0;
 
-    int traceCycle = 4;
-    char buf[256];
-    sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/diskids%d", traceCycle, n->rain_stripe_size - 1, n->tracefile);
-    printf("tracefile %s\n", buf);
+    const int rounds = 3;
+    const double rs[3] = { 0.5,0.5,0.9 }, hs[3] = { 0.5,0.5,0.1 };
+    const int cycles[3] = { 4,8,4 }, footprints[3] = { 5,10,5 };
 
-    int full = 0;
-    FILE* fp = fopen(buf, "r");
-    while (fscanf(fp, "%d", &full) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycle%d+1/ECCPWL%dfull%d", traceCycle, n->rain_stripe_size - 1, n->pwl, full);
-        outfp = fopen(buf, "w");
-        printf("outfile %s\n", buf);
+    for (int i = 0;i < rounds;i += 1) {
+        double r = rs[i], h = hs[i];
+        int traceCycle = cycles[i], footprint = footprints[i];
+        char buf[256];
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/diskids%d", r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->tracefile);
+        printf("tracefile %s\n", buf);
 
-        int prefillmb = 20 * 1024 * full / 100;
-        for (int mb = 0;mb < prefillmb;mb += 1) {
-            offset = (uint64_t)mb * 1024 * 1024;
-            len = 1024 * 1024;
-            rq.slba = offset / ssd->sp.secsz;
-            rq.nlb = len / ssd->sp.secsz;
+        int full = 0;
+        FILE* fp = fopen(buf, "r");
+        while (fscanf(fp, "%d", &full) != EOF) {
+            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/ECCPWL%dfull%d", r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->pwl, full);
+            outfp = fopen(buf, "w");
+            printf("outfile %s\n", buf);
 
-            ssd_write(ssd, &rq);
-            if (should_gc(ssd)) {
-                do_gc(ssd, false);
-            }
-        }
-        printf("\nprefill %d MB\n", prefillmb);
-
-        while (currErrorRate < targetErrorRate) {
-            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r0.9h0.1footprint100size20GB%dcycletrace", traceCycle);
-            FILE* fpin = fopen(buf, "r");
-            while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
+            int prefillmb = 20 * 1024 * full / 100;
+            for (int mb = 0;mb < prefillmb;mb += 1) {
+                offset = (uint64_t)mb * 1024 * 1024;
+                len = 1024 * 1024;
                 rq.slba = offset / ssd->sp.secsz;
                 rq.nlb = len / ssd->sp.secsz;
 
@@ -1312,18 +1304,33 @@ static void SynthTrace(FemuCtrl* n) {
                 if (should_gc(ssd)) {
                     do_gc(ssd, false);
                 }
-
-                if (currErrorRate >= targetErrorRate) {
-                    break;
-                }
             }
-            fclose(fpin);
+            printf("\nprefill %d MB\n", prefillmb);
+
+            while (currErrorRate < targetErrorRate) {
+                sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycletrace", r, h, footprint, traceCycle);
+                FILE* fpin = fopen(buf, "r");
+                while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
+                    rq.slba = offset / ssd->sp.secsz;
+                    rq.nlb = len / ssd->sp.secsz;
+
+                    ssd_write(ssd, &rq);
+                    if (should_gc(ssd)) {
+                        do_gc(ssd, false);
+                    }
+
+                    if (currErrorRate >= targetErrorRate) {
+                        break;
+                    }
+                }
+                fclose(fpin);
+            }
+            fflush(outfp);
+            fclose(outfp);
+            ResetState(ssd);
         }
-        fflush(outfp);
-        fclose(outfp);
-        ResetState(ssd);
+        fclose(fp);
     }
-    fclose(fp);
 }
 
 static void* trace(void* arg) {
