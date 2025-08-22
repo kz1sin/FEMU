@@ -433,6 +433,7 @@ static inline void check_addr(int a, int max)
 static struct ppa get_new_page(struct ssd* ssd)
 {
     struct write_pointer* wpp = &ssd->wp;
+    assert(wpp->curline != NULL);
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -488,7 +489,7 @@ static struct line* get_next_free_line(struct ssd* ssd)
     if (reforge == 2 && spp->superl > 0) {
         st = pqueue_peek(freeMinUPERPQ);
         if (!st) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+            // ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
             return NULL;
         }
         pqueue_pop(freeMinUPERPQ);
@@ -496,7 +497,7 @@ static struct line* get_next_free_line(struct ssd* ssd)
     } else {
         st = QTAILQ_FIRST(&freeStripeList);
         if (!st) {
-            ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+            // ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
             return NULL;
         }
         QTAILQ_REMOVE(&freeStripeList, st, entry);
@@ -581,20 +582,10 @@ static void ssd_advance_write_pointer(struct ssd* ssd)
 
                 /* current line is used up, pick another empty line */
                 check_addr(wpp->blk, spp->blks_per_pl);
-                wpp->curline = NULL;
                 wpp->curline = get_next_free_line(ssd);
-                if (!wpp->curline) {
-                    /* TODO */
-                    abort();
+                if (wpp->curline != NULL) {
+                    wpp->blk = wpp->curline->id;
                 }
-                wpp->blk = wpp->curline->id;
-                check_addr(wpp->blk, spp->blks_per_pl);
-                /* make sure we are starting from page 0 in the super block */
-                ftl_assert(wpp->pg == 0);
-                ftl_assert(wpp->lun == 0);
-                ftl_assert(wpp->ch == 0);
-                /* TODO: assume # of pl_per_lun is 1, fix later */
-                ftl_assert(wpp->pl == 0);
             }
         }
     }
@@ -1447,6 +1438,7 @@ static int do_gc(struct ssd* ssd, bool force)
 {
     // struct line* victim_line = NULL;
     struct ssdparams* spp = &ssd->sp;
+    struct write_pointer* wpp = &ssd->wp;
     struct nand_lun* lunp;
 
     StripeInfo* victim_stripe = select_victim_stripe(ssd, force);
@@ -1502,6 +1494,11 @@ static int do_gc(struct ssd* ssd, bool force)
     victim_stripe->upersum = newsum;
     gcCount += 1;
     mark_stripe_free(ssd, &ppa);
+    if (wpp->curline == NULL) {
+        wpp->curline = get_next_free_line(ssd);
+        assert(wpp->curline != NULL);
+        wpp->blk = wpp->curline->id;
+    }
 
     if (gcCount % (spp->tt_lines / linecnt * 10) == 0) {
         int cycles = ssdPageWrites / spp->tt_pgs;
@@ -2138,11 +2135,11 @@ static void SynthTrace(FemuCtrl* n) {
     NvmeRequest rq;
     rq.stime = 0;
 
-    const int rounds = 3;
-    const double rs[3] = { 0.5,0.5,0.9 }, hs[3] = { 0.5,0.5,0.1 };
-    const int cycles[3] = { 4,8,4 }, footprints[3] = { 5,10,5 };
+    #define ROUNDS 1
+    const double rs[ROUNDS] = { 0.9 }, hs[ROUNDS] = { 0.1 };
+    const int cycles[ROUNDS] = { 4 }, footprints[ROUNDS] = { 5 };
 
-    for (int i = 0;i < rounds;i += 1) {
+    for (int i = 0;i < ROUNDS;i += 1) {
         double r = rs[i], h = hs[i];
         int traceCycle = cycles[i], footprint = footprints[i];
         char buf[256];

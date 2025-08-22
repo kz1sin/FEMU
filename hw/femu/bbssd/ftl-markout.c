@@ -1275,11 +1275,11 @@ static void SynthTrace(FemuCtrl* n) {
     NvmeRequest rq;
     rq.stime = 0;
 
-    const int rounds = 3;
-    const double rs[3] = { 0.5,0.5,0.9 }, hs[3] = { 0.5,0.5,0.1 };
-    const int cycles[3] = { 4,8,4 }, footprints[3] = { 5,10,5 };
+    #define ROUNDS 1
+    const double rs[ROUNDS] = { 0.5 }, hs[ROUNDS] = { 0.5 };
+    const int cycles[ROUNDS] = { 8 }, footprints[ROUNDS] = { 10 };
 
-    for (int i = 0;i < rounds;i += 1) {
+    for (int i = 0;i < ROUNDS;i += 1) {
         double r = rs[i], h = hs[i];
         int traceCycle = cycles[i], footprint = footprints[i];
         char buf[256];
