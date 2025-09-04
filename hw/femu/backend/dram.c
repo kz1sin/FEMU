@@ -16,16 +16,17 @@ int init_dram_backend(SsdDramBackend** mbe, int64_t nbytes, int stripesize, int 
         b->size = nbytes;
         b->parity_start = 0;
     }
-    b->logical_space = g_malloc0(b->size);
+    b->logical_space = NULL;
+    // b->logical_space = g_malloc0(b->size);
 
-    printf("backend size: %ld\n", b->size);
+    // printf("backend size: %ld\n", b->size);
 
-    if (mlock(b->logical_space, b->size) == -1) {
-        femu_err("Failed to pin the memory backend to the host DRAM\n");
-        g_free(b->logical_space);
-        abort();
-    }
-    memset(b->logical_space, 0, b->size);
+    // if (mlock(b->logical_space, b->size) == -1) {
+    //     femu_err("Failed to pin the memory backend to the host DRAM\n");
+    //     g_free(b->logical_space);
+    //     abort();
+    // }
+    // memset(b->logical_space, 0, b->size);
 
     return 0;
 }

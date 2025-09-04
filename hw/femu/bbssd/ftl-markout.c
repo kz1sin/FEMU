@@ -20,6 +20,7 @@ pqueue_t* writtenMinPQ; // priority queue for PWL
 // remains
 int logicalPages = 0, markoutLimit = 0;
 static double targetErrorRate = 0;
+static QemuThread trace_thread;
 
 // RBER model parameters
 static const double K = 2.05;
@@ -119,6 +120,7 @@ void dumpBlocks(struct ssd* ssd) {
 }
 
 static void* ftl_thread(void* arg);
+static void* trace(void* arg);
 
 static inline bool should_gc(struct ssd* ssd)
 {
@@ -551,8 +553,11 @@ void ssd_init(FemuCtrl* n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
-    qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
-        QEMU_THREAD_JOINABLE);
+    if (true) {
+        qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
+    } else {
+        qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n, QEMU_THREAD_JOINABLE);
+    }
 }
 
 static inline bool valid_ppa(struct ssd* ssd, struct ppa* ppa)
@@ -1211,8 +1216,6 @@ static void ResetState(struct ssd* ssd) {
     currErrorRate = 0;
 }
 
-static QemuThread trace_thread;
-
 static void DiskTrace(FemuCtrl* n) {
     struct ssd* ssd = n->ssd;
     uint64_t offset = 0, len = 0;
@@ -1226,7 +1229,7 @@ static void DiskTrace(FemuCtrl* n) {
     int diskid = 0;
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/disk%dprefillECCPWL%d", n->tracediskGB, diskid, n->pwl);
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/%d+1/disk%dprefillECCPWL%d", n->tracediskGB, n->rain_stripe_size - 1, diskid, n->pwl);
         outfp = fopen(buf, "w");
         printf("outfile %s\n", buf);
 
@@ -1334,7 +1337,6 @@ static void SynthTrace(FemuCtrl* n) {
 }
 
 static void* trace(void* arg) {
-    sleep(30);
     FemuCtrl* n = (FemuCtrl*)arg;
     if (n->tracediskGB > 0) {
         DiskTrace(n);

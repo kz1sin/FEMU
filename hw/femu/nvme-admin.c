@@ -270,15 +270,14 @@ static void nvme_init_poller(FemuCtrl *n)
     }
 
     n->poller = g_malloc0(sizeof(QemuThread) * (n->nr_pollers + 1));
-    NvmePollerThreadArgument *args = malloc(sizeof(NvmePollerThreadArgument) *
-                                            (n->nr_pollers + 1));
-    for (i = 1; i <= n->nr_pollers; i++) {
-        args[i].n = n;
-        args[i].index = i;
-        qemu_thread_create(&n->poller[i], "femu-nvme-poller", nvme_poller,
-                &args[i], QEMU_THREAD_JOINABLE);
-        femu_debug("femu-nvme-poller [%d] created ...\n", i - 1);
-    }
+    // NvmePollerThreadArgument* args = malloc(sizeof(NvmePollerThreadArgument) * (n->nr_pollers + 1));
+    // for (i = 1; i <= n->nr_pollers; i++) {
+    //     args[i].n = n;
+    //     args[i].index = i;
+    //     qemu_thread_create(&n->poller[i], "femu-nvme-poller", nvme_poller,
+    //             &args[i], QEMU_THREAD_JOINABLE);
+    //     femu_debug("femu-nvme-poller [%d] created ...\n", i - 1);
+    // }
 }
 
 static uint16_t nvme_set_db_memory(FemuCtrl *n, const NvmeCmd *cmd)

@@ -33,6 +33,7 @@ static double* lineuper;
 static const uint64_t PARITYLPN = INVALID_LPN - 1;
 int logicalPages = 0, RAINlogicalPages = 0, totalStripes = 0, RAINCycleLimit = 0;
 static double targetErrorRate = 0;
+static QemuThread trace_thread;
 
 // RBER model parameters
 static const double K = 2.05;
@@ -80,7 +81,8 @@ static double DevicePFail(struct ssd* ssd) {
             sum += lineuper[ln];
             minus += lineuper[ln] * lineuper[ln];
         }
-        assert(sum == stripeinfo[s].upersum);
+        double err = fabs((sum - stripeinfo[s].upersum) / sum);
+        assert(err < 1e-10);
         double stripeuper = (sum * sum - minus) / 2.0;
         if (s == 0 || sum > maxupersum) {
             maxupersum = sum;
@@ -129,6 +131,7 @@ void dumpBlocks(struct ssd* ssd) {
 }
 
 static void* ftl_thread(void* arg);
+static void* trace(void* arg);
 
 static inline bool should_gc(struct ssd* ssd)
 {
@@ -633,8 +636,11 @@ void ssd_init(FemuCtrl* n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
-    qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
-        QEMU_THREAD_JOINABLE);
+    if (true) {
+        qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
+    } else {
+        qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n, QEMU_THREAD_JOINABLE);
+    }
 }
 
 static inline bool valid_ppa(struct ssd* ssd, struct ppa* ppa)
@@ -1317,8 +1323,6 @@ static void ResetState(struct ssd* ssd) {
     currErrorRate = 0;
 }
 
-static QemuThread trace_thread;
-
 static void DiskTrace(FemuCtrl* n) {
     struct ssd* ssd = n->ssd;
     uint64_t offset = 0, len = 0;
@@ -1332,7 +1336,7 @@ static void DiskTrace(FemuCtrl* n) {
     int diskid = 0;
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/disk%dprefillPPNRAINPWL%d", n->tracediskGB, diskid, n->pwl);
+        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/%d+1/disk%dprefillPPNRAINPWL%d", n->tracediskGB, n->rain_stripe_size - 1, diskid, n->pwl);
         outfp = fopen(buf, "w");
         printf("outfile %s\n", buf);
 
@@ -1440,7 +1444,6 @@ static void SynthTrace(FemuCtrl* n) {
 }
 
 static void* trace(void* arg) {
-    sleep(30);
     FemuCtrl* n = (FemuCtrl*)arg;
     if (n->tracediskGB > 0) {
         DiskTrace(n);
