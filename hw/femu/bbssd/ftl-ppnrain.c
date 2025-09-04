@@ -1444,6 +1444,7 @@ static void SynthTrace(FemuCtrl* n) {
 }
 
 static void* trace(void* arg) {
+    sleep(30);
     FemuCtrl* n = (FemuCtrl*)arg;
     if (n->tracediskGB > 0) {
         DiskTrace(n);
