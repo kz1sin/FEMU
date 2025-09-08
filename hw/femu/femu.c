@@ -669,6 +669,7 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT8("zns_num_plane", FemuCtrl, zns_params.zns_num_plane, 2),
     DEFINE_PROP_UINT8("zns_num_blk", FemuCtrl, zns_params.zns_num_blk, 32),
     DEFINE_PROP_INT32("zns_flash_type", FemuCtrl, zns_params.zns_flash_type, QLC),
+    DEFINE_PROP_STRING("tracepath", FemuCtrl, tracepath),
     DEFINE_PROP_INT32("tracefile", FemuCtrl, tracefile, 0),
     DEFINE_PROP_INT32("tracediskGB", FemuCtrl, tracediskGB, 0),
     DEFINE_PROP_INT32("pwl", FemuCtrl, pwl, 0),

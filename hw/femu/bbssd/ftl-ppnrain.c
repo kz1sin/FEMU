@@ -1330,17 +1330,17 @@ static void DiskTrace(FemuCtrl* n) {
     rq.stime = 0;
 
     char buf[256];
-    sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/diskids%d", n->tracediskGB, n->tracefile);
+    sprintf(buf, "%ssizeGB%d/diskids%d", n->tracepath, n->tracediskGB, n->tracefile);
     printf("tracefile %s\n", buf);
 
     int diskid = 0;
     FILE* fp = fopen(buf, "r");
     while (fscanf(fp, "%d", &diskid) != EOF) {
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/reforge/%d+1/disk%dprefillPPNRAINPWL%d", n->tracediskGB, n->rain_stripe_size - 1, diskid, n->pwl);
+        sprintf(buf, "%ssizeGB%d/reforge/%d+1/disk%dprefillPPNRAINPWL%d", n->tracepath, n->tracediskGB, n->rain_stripe_size - 1, diskid, n->pwl);
         outfp = fopen(buf, "w");
         printf("outfile %s\n", buf);
 
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/readprefill/disk%d", n->tracediskGB, diskid);
+        sprintf(buf, "%ssizeGB%d/readprefill/disk%d", n->tracepath, n->tracediskGB, diskid);
         FILE* fpin = fopen(buf, "r");
         while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
             rq.slba = offset / ssd->sp.secsz;
@@ -1353,7 +1353,7 @@ static void DiskTrace(FemuCtrl* n) {
         }
         fclose(fpin);
 
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/sizeGB%d/write/disk%d", n->tracediskGB, diskid);
+        sprintf(buf, "%ssizeGB%d/write/disk%d", n->tracepath, n->tracediskGB, diskid);
         while (currErrorRate < targetErrorRate) {
             fpin = fopen(buf, "r");
             while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
@@ -1393,13 +1393,13 @@ static void SynthTrace(FemuCtrl* n) {
         double r = rs[i], h = hs[i];
         int traceCycle = cycles[i], footprint = footprints[i];
         char buf[256];
-        sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/diskids%d", r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->tracefile);
+        sprintf(buf, "%ssynthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/diskids%d", n->tracepath, r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->tracefile);
         printf("tracefile %s\n", buf);
 
         int full = 0;
         FILE* fp = fopen(buf, "r");
         while (fscanf(fp, "%d", &full) != EOF) {
-            sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/PPNRAINPWL%dfull%d", r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->pwl, full);
+            sprintf(buf, "%ssynthetic/r%gh%gfootprint%dsize20GB%dcycle%d+1/PPNRAINPWL%dfull%d", n->tracepath, r, h, footprint, traceCycle, n->rain_stripe_size - 1, n->pwl, full);
             outfp = fopen(buf, "w");
             printf("outfile %s\n", buf);
 
@@ -1418,7 +1418,7 @@ static void SynthTrace(FemuCtrl* n) {
             printf("\nprefill %d MB\n", prefillmb);
 
             while (currErrorRate < targetErrorRate) {
-                sprintf(buf, "/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/synthetic/r%gh%gfootprint%dsize20GB%dcycletrace", r, h, footprint, traceCycle);
+                sprintf(buf, "%ssynthetic/r%gh%gfootprint%dsize20GB%dcycletrace", n->tracepath, r, h, footprint, traceCycle);
                 FILE* fpin = fopen(buf, "r");
                 while (fscanf(fpin, "%lu %lu", &offset, &len) != EOF) {
                     rq.slba = offset / ssd->sp.secsz;

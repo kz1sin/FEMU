@@ -1,58 +1,43 @@
+declare -a PIDS=()
+
 cleanup() {
-    echo "start kill"
+    for PID in "${PIDS[@]}"; do
+        echo "kill $PID"
+        kill $PID
+    done
+    wait
+
+    echo "start kill qemu"
     pkill -e qemu
     echo "end kill"
-    exit 0
+    exit 1
 }
 
-trap cleanup INT
+trap cleanup SIGINT
 
-pwl=(0 50)
+disksizes=(200 100)
+pwl=(50)
 superl=(-1 0 1)
 rain_stripe_size=(4 8)
 worker=1
 
-for ((r=0; r<2; r++)); do
-    for ((t=1; t<=6; t++)); do
-        for ((p=0; p<2; p++)); do
-            bash run-markout100GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} &
-            echo "run-markout100GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]}"
-            ((worker++))
-            sleep 3
+dlen=${#disksizes[@]}
+plen=${#pwl[@]}
+slen=${#superl[@]}
+rlen=${#rain_stripe_size[@]}
+traces=60
+sleeptime=20
 
-            bash run-ppnrain100GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} &
-            echo "run-ppnrain100GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]}"
-            ((worker++))
-            sleep 3
-
-            for ((s=0; s<3; s++)); do
-                bash run-reforge100GBdisk.sh $worker $t ${pwl[$p]} ${superl[$s]} ${rain_stripe_size[$r]} &
-                echo "run-reforge100GBdisk.sh $worker $t ${pwl[$p]} ${superl[$s]} ${rain_stripe_size[$r]}"
+for ((d=0; d<$dlen; d++)); do
+    for ((r=0; r<$rlen; r++)); do
+        for ((t=1; t<=$traces; t++)); do
+            for ((p=0; p<$plen; p++)); do
+                echo "run-alldisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} ${disksizes[$d]}"
+                bash run-alldisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} ${disksizes[$d]} &
+                pid=$!
+                PIDS+=($pid)
                 ((worker++))
-                sleep 3
-            done
-        done
-    done
-done
-
-for ((r=0; r<2; r++)); do
-    for ((t=1; t<=6; t++)); do
-        for ((p=0; p<2; p++)); do
-            bash run-markout200GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} &
-            echo "run-markout200GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]}"
-            ((worker++))
-            sleep 3
-
-            bash run-ppnrain200GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]} &
-            echo "run-ppnrain200GBdisk.sh $worker $t ${pwl[$p]} ${superl[0]} ${rain_stripe_size[$r]}"
-            ((worker++))
-            sleep 3
-
-            for ((s=0; s<3; s++)); do
-                bash run-reforge200GBdisk.sh $worker $t ${pwl[$p]} ${superl[$s]} ${rain_stripe_size[$r]} &
-                echo "run-reforge200GBdisk.sh $worker $t ${pwl[$p]} ${superl[$s]} ${rain_stripe_size[$r]}"
-                ((worker++))
-                sleep 3
+                sleep $sleeptime
             done
         done
     done

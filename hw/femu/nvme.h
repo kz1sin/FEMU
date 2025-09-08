@@ -1293,7 +1293,6 @@ typedef struct FemuCtrl {
     bool        vector_poll_started;
 
     char            *serial;
-    char            *logfile;
     NvmeErrorLog    *elpes;
     NvmeRequest     **aer_reqs;
     NvmeNamespace   *namespaces;
@@ -1340,6 +1339,7 @@ typedef struct FemuCtrl {
 
     BbCtrlParams bb_params;
 
+    char* tracepath;
     int rain_stripe_size;
     int pwl, superl;
     int tracefile;

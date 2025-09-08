@@ -1,12 +1,22 @@
+tracediskGB=$6
+
+worker=$1
+tracefile=$2
+pwl=$3
+superl=$4
+rain_stripe_size=$5
+logfile=$(printf "logworker%s" $worker)
+tracepath="/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/"
+
 # Configurable SSD Controller layout parameters (must be power of 2)
 secsz=512 # sector size in bytes
 secs_per_pg=8 # number of sectors in a flash page
 pgs_per_blk=1024 # number of pages per flash block
-blks_per_pl=17920 # number of blocks per plane
+blks_per_pl=$((tracediskGB * rain_stripe_size * 8 * 21 / 5 / (rain_stripe_size - 1))) # number of blocks per plane
 pls_per_lun=1 # keep it at one, no multiplanes support
 luns_per_ch=1 # number of chips per channel
-nchs=4 # number of channels
-ssd_size=204800 # in megabytes, if you change the above layout parameters, make sure you manually recalculate the ssd size and modify it here, please consider a default 25% overprovisioning ratio.
+nchs=8 # number of channels
+ssd_size=$((tracediskGB * 1024)) # in megabytes, if you change the above layout parameters, make sure you manually recalculate the ssd size and modify it here, please consider a default 25% overprovisioning ratio.
 
 # Latency in nanoseconds
 pg_rd_lat=4 # page read latency
@@ -18,18 +28,6 @@ ch_xfer_lat=0 # channel transfer time, ignored for now
 gc_thres_pcent=74
 gc_thres_pcent_rain=97
 gc_thres_pcent_high=98
-
-tracediskGB=200
-
-worker=$1
-tracefile=$2
-pwl=$3
-superl=$4
-rain_stripe_size=$5
-logfile=$(printf "logworker%s" $worker)
-
-# test=$(printf "worker %s trace %s pwl %s superl %s size %s" $worker $tracefile $pwl $superl $rain_stripe_size)
-# echo $test > $logfile
 
 #-----------------------------------------------------------------------
 
@@ -57,8 +55,11 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",tracediskGB=${tracediskGB}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",tracefile=${tracefile}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",pwl=${pwl}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",superl=${superl}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",tracepath=${tracepath}"
 
-./qemu-system-ppnrain \
+echo ${FEMU_OPTIONS} >> $logfile
+
+./qemu-system-reforge \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \
@@ -66,4 +67,4 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",superl=${superl}"
     -m 4G \
     -device virtio-scsi-pci,id=scsi0 \
     ${FEMU_OPTIONS} \
-    -nographic > $logfile 2>&1
+    -nographic >> $logfile 2>&1
