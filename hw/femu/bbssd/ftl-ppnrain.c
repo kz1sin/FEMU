@@ -636,7 +636,7 @@ void ssd_init(FemuCtrl* n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
-    if (true) {
+    if (false) {
         qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
     } else {
         qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n, QEMU_THREAD_JOINABLE);
@@ -1073,6 +1073,7 @@ static void mark_stripe_free(struct ssd* ssd, struct ppa* ppa)
         LineInfo* curr = &lineinfo[line->id];
         if (curr->erasecount > threshold) {
             StripeInfo* minwritten = pqueue_pop(writtenMinPQ);
+            assert(minwritten != NULL);
             minwritten->writtenMinPos = 0;
             MoveColdData(ssd, minwritten, stripe);
             QTAILQ_INSERT_TAIL(&freeStripeList, minwritten, entry);
@@ -1473,7 +1474,10 @@ static void* ftl_thread(void* arg)
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
 
-    qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
+    outfp = fopen("/home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio", "w");
+    printf("outfile /home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio\n");
+
+    // qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
 
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {

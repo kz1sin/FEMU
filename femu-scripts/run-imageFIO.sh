@@ -1,3 +1,7 @@
+#!/bin/bash
+# Huaicheng Li <huaicheng@cs.uchicago.edu>
+# Run FEMU as a black-box SSD (FTL managed by the device)
+
 tracediskGB=$6
 
 worker=$1
@@ -7,6 +11,11 @@ superl=$4
 rain_stripe_size=$5
 logfile=$(printf "logworker%s" $worker)
 tracepath="/home/ubuntu/share/alibabatrace/alibaba_block_traces_2020/"
+
+# image directory
+IMGDIR=/home/ubuntu/share/imageFEMU
+# Virtual machine disk image
+OSIMGF=$IMGDIR/u20s.qcow2
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 secsz=512 # sector size in bytes
@@ -19,15 +28,15 @@ nchs=8 # number of channels
 ssd_size=$((tracediskGB * 1024)) # in megabytes, if you change the above layout parameters, make sure you manually recalculate the ssd size and modify it here, please consider a default 25% overprovisioning ratio.
 
 # Latency in nanoseconds
-pg_rd_lat=4 # page read latency
-pg_wr_lat=20 # page write latency
-blk_er_lat=20 # block erase latency
+pg_rd_lat=40000 # page read latency
+pg_wr_lat=200000 # page write latency
+blk_er_lat=2000000 # block erase latency
 ch_xfer_lat=0 # channel transfer time, ignored for now
 
 # GC Threshold (1-100)
 gc_thres_pcent=$((((rain_stripe_size - 1) * 100 - 1) / rain_stripe_size))
 gc_thres_pcent_rain=97
-gc_thres_pcent_high=98
+gc_thres_pcent_high=97
 
 #-----------------------------------------------------------------------
 
@@ -57,14 +66,30 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",pwl=${pwl}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",superl=${superl}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",tracepath=${tracepath}"
 
-echo ${FEMU_OPTIONS} >> $logfile
+echo ${FEMU_OPTIONS} | tee $logfile
 
-./qemu-system-reforge \
+if [[ ! -e "$OSIMGF" ]]; then
+	echo ""
+	echo "VM disk image couldn't be found ..."
+	echo "Please prepare a usable VM image and place it as $OSIMGF"
+	echo "Once VM disk image is ready, please rerun this script again"
+	echo ""
+	exit
+fi
+
+./qemu-system-x86_64 \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \
     -smp 4 \
     -m 4G \
     -device virtio-scsi-pci,id=scsi0 \
+    -device scsi-hd,drive=hd0 \
+    -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \
     ${FEMU_OPTIONS} \
-    -nographic >> $logfile 2>&1
+    -net user,hostfwd=tcp::8080-:22 \
+    -net nic,model=virtio \
+    -virtfs local,path=/home/ubuntu/share/FEMUTest/FEMU/build-femu/fioeval,mount_tag=host0,security_model=passthrough,id=host0 \
+    -device virtio-9p-pci,fsdev=host0,mount_tag=hostshare \
+    -nographic \
+    -qmp unix:./qmp-sock,server,nowait 2>&1 | tee -a $logfile

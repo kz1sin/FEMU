@@ -25,7 +25,7 @@ blk_er_lat=20 # block erase latency
 ch_xfer_lat=0 # channel transfer time, ignored for now
 
 # GC Threshold (1-100)
-gc_thres_pcent=74
+gc_thres_pcent=$((((rain_stripe_size - 1) * 100 - 1) / rain_stripe_size))
 gc_thres_pcent_rain=97
 gc_thres_pcent_high=98
 

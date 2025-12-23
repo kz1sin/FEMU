@@ -368,13 +368,15 @@ static void ssd_init_lines(struct ssd* ssd)
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
 
+    int initEC = 1000;
+
     writtenMinECPQ = pqueue_init(spp->tt_lines, MinECCmpPri, ECGetPri, ECSetPri, WrittenMinGetPos, WrittenMinSetPos);
     freeMinUPERPQ = pqueue_init(totalStripes, MinUPERCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
     freeMaxUPERPQ = pqueue_init(totalStripes, MaxUPERCmpPri, UPERGetPri, UPERSetPri, FreeMaxGetPos, FreeMaxSetPos);
     lineinfo = g_malloc0(sizeof(LineInfo) * spp->tt_lines);
     for (int i = 0;i < spp->tt_lines;i += 1) {
         lineinfo[i].ln = &lm->lines[i];
-        lineinfo[i].erasecount = 0;
+        lineinfo[i].erasecount = initEC;
         lineinfo[i].writtenMinPos = 0;
     }
 
@@ -383,7 +385,7 @@ static void ssd_init_lines(struct ssd* ssd)
     victimStripePQ = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri, victim_line_set_pri, victim_line_get_pos, victim_line_set_pos);
     victimStripePQsuperl = pqueue_init(spp->tt_lines, victim_line_cmp_pri_superl, victim_line_get_pri_superl, victim_line_set_pri, victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&fullStripeList);
-    double init = UPER(0);
+    double init = UPER(initEC);
     stripeinfo = g_malloc0(sizeof(StripeInfo) * spp->tt_lines);
     for (int i = 0;i < spp->tt_lines;i += 1) {
         stripeinfo[i].ipc = stripeinfo[i].vpc = 0;
@@ -785,7 +787,12 @@ void ssd_init(FemuCtrl* n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
-    if (true) {
+    outfp = fopen("/home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio", "w");
+    printf("outfile /home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio\n");
+
+    reforgeSSD(ssd);
+
+    if (false) {
         qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
     } else {
         qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n, QEMU_THREAD_JOINABLE);
@@ -1425,6 +1432,7 @@ static void mark_stripe_free(struct ssd* ssd, struct ppa* ppa)
                 LineInfo* curr = &lineinfo[line->id];
                 if (curr->erasecount > threshold) {
                     StripeInfo* minwritten = pqueue_pop(writtenMinECPQ);
+                    assert(minwritten != NULL);
                     minwritten->writtenMinPos = 0;
                     MoveColdData(ssd, minwritten, stripe);
                     QTAILQ_INSERT_TAIL(&freeStripeList, minwritten, entry);
@@ -2227,7 +2235,7 @@ static void* ftl_thread(void* arg)
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
 
-    qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
+    // qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
 
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {

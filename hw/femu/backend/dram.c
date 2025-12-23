@@ -16,17 +16,17 @@ int init_dram_backend(SsdDramBackend** mbe, int64_t nbytes, int stripesize, int 
         b->size = nbytes;
         b->parity_start = 0;
     }
-    b->logical_space = NULL;
-    // b->logical_space = g_malloc0(b->size);
+    // b->logical_space = NULL;
+    b->logical_space = g_malloc0(b->size);
 
-    // printf("backend size: %ld\n", b->size);
+    printf("backend size: %ld\n", b->size);
 
-    // if (mlock(b->logical_space, b->size) == -1) {
-    //     femu_err("Failed to pin the memory backend to the host DRAM\n");
-    //     g_free(b->logical_space);
-    //     abort();
-    // }
-    // memset(b->logical_space, 0, b->size);
+    if (mlock(b->logical_space, b->size) == -1) {
+        femu_err("Failed to pin the memory backend to the host DRAM\n");
+        g_free(b->logical_space);
+        abort();
+    }
+    memset(b->logical_space, 0, b->size);
 
     return 0;
 }
@@ -71,6 +71,11 @@ int backend_rw(SsdDramBackend* b, QEMUSGList* qsg, uint64_t* lbal, bool is_write
         //     parity_offset = b->parity_start + stripe_id * b->pagesize;
         //     update_parity(mb + mb_oft, mb + parity_offset, b->pagesize);
         // }
+
+        if (mb_oft + cur_len > b->size) {
+            printf("%lu+%lu\n", mb_oft, cur_len);
+        }
+        assert(mb_oft + cur_len <= b->size);
 
         if (dma_memory_rw(qsg->as, cur_addr, mb + mb_oft, cur_len, dir, MEMTXATTRS_UNSPECIFIED)) {
             femu_err("dma_memory_rw error\n");
