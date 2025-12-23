@@ -1,0 +1,1 @@
+fio --name=seqwrite1M --ioengine=libaio -thread --rw=write --bs=1M --size=256M --numjobs=1 --iodepth=64 --directory=/home/femu/ssd/update --runtime=10 --time_based --group_reporting --direct=1 | tee logseqwrite1M

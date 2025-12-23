@@ -1,0 +1,1 @@
+fio --name=randread4k --ioengine=libaio --rw=randread --bs=4k --size=256M --numjobs=1 --iodepth=64 --directory=/home/femu/ssd/update --runtime=10 --time_based --group_reporting --direct=1 | tee lograndread4k

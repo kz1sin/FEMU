@@ -368,7 +368,7 @@ static void ssd_init_lines(struct ssd* ssd)
     lm->victim_line_cnt = 0;
     lm->full_line_cnt = 0;
 
-    int initEC = 1000;
+    int initEC = 0;
 
     writtenMinECPQ = pqueue_init(spp->tt_lines, MinECCmpPri, ECGetPri, ECSetPri, WrittenMinGetPos, WrittenMinSetPos);
     freeMinUPERPQ = pqueue_init(totalStripes, MinUPERCmpPri, UPERGetPri, UPERSetPri, FreeMinGetPos, FreeMinSetPos);
@@ -790,7 +790,7 @@ void ssd_init(FemuCtrl* n)
     outfp = fopen("/home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio", "w");
     printf("outfile /home/ubuntu/share/FEMUTest/FEMU/build-femu/logimagefio\n");
 
-    reforgeSSD(ssd);
+    // reforgeSSD(ssd);
 
     if (false) {
         qemu_thread_create(&trace_thread, "trace-Thread", trace, n, QEMU_THREAD_JOINABLE);
